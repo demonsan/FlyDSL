@@ -122,9 +122,11 @@ def load_entries(cache_dir: Path) -> list:
     return entries
 
 
-def replace_binary(ir_text: str, isa_path: Path, clang: Path = None) -> tuple:
+def replace_binary(ir_text: str, isa_path: Path, clang: Path = None, code_object: bytes = None) -> tuple:
     """Assemble ``isa_path`` for the module's chip and swap it into its single ``gpu.binary``.
 
+    A ready ``code_object`` (a linked HSA code object, e.g. from another LLVM's
+    ``llc`` + ``ld.lld``) is swapped in as is; ``isa_path`` is then ignored.
     Returns ``(new_ir_text, code_object, original_code_object)``.
     """
     from flydsl._mlir import ir
@@ -146,7 +148,8 @@ def replace_binary(ir_text: str, isa_path: Path, clang: Path = None) -> tuple:
         if chip is None:
             sys.exit(f"inject_asm: no chip in the entry's target {old.target}")
 
-        code_object = assemble(isa_path, chip.group(1), clang)
+        if code_object is None:
+            code_object = assemble(isa_path, chip.group(1), clang)
         # Binary, never Assembly: an Assembly object would be loaded through
         # mgpuModuleLoadJIT, which HIP does not implement.  The original kernel
         # metadata is dropped rather than carried over stale.
