@@ -331,3 +331,267 @@ bf16, non-causal; `flash_attn_gfx950.py` (hand) vs `flash_attn_sched_gfx950.py`
   contains no instruction-level cause for this gap. The only differences are the
   kernel-argument block size and layout. Whether that layout causes the gap was
   not tested.
+
+## Per-group programs
+
+By default every wave group runs the same program, and the dual-wave phase offset
+is the run-time `stagger` barrier. A schedule can instead give each group its own
+program, which shares the buffers and queues:
+
+```python
+Schedule(..., groups=2, sections=prog0, group_sections=[prog0, prog1])
+```
+
+`sections` is then group 0's program, so single-program tools see group 0's code.
+`sections_of(g)` returns group `g`'s program, and `all_sections()` / `all_ops()`
+cover every group, so the kernel's binding check sees everything.
+
+**Verifier.** Each group's trace is simulated with its own barrier indices. The traces
+are merged by barrier phase, so ops of different groups between the same two barriers
+count as concurrent, and only a barrier that both groups cross orders them.
+
+* Wait counters, registers, scope and tile coverage are tracked per group.
+* LDS slots are shared, and a slot holds a tile only once every group that writes it
+  has written its part. Cross-group RAW/WAR use each group's own barrier index.
+* Findings carry a `g<k>:` location prefix.
+* `SYNC.BARRIER_MISMATCH` (error): the groups execute different numbers of
+  `s_barrier` for some tile count, so one group waits forever. This check also covers
+  single programs, for example an unpaired `stagger open`.
+
+**Emission.** `emit_program(..., group_id=v)` emits each group's program in its own
+branch of an `scf.if` chain on the wave-uniform group id `v`, so the code is
+duplicated like the two loop copies of the aiter `.co`. Each branch starts from a
+copy of `env`. `flash_attn_sched_gfx950.py` passes `ctx.stagger_i32`
+(`readfirstlane(wave) // 4`).
+
+**MHA variant** (`kernels/attention/sched/mha_gfx950_2prog.py`): two programs built
+from the single-program schedule. The stagger becomes code: group 1 has a plain
+barrier in its prologue and group 0 one at the end. Barrier `k` therefore pairs group
+0's cluster `c` with group 1's cluster `c-1`, exactly as with the stagger. The
+`prio` argument chooses how `s_setprio` is used:
+
+* `toggle`: the single schedule's per-cluster `s_setprio 1`/`0`.
+* `static`: one priority per group for the whole program, as the `.co` does. Group 0
+  and group 1 get `static_prio`, default `(0, 1)`.
+
+GPU check (MI355X GPU 2, 2026-10-19). Container `rocm/atom:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0_atom0.1.4`,
+the `flydsl==0.4.0` wheel's `_mlir` with this branch's Python, clocks not pinned.
+
+* Correctness: 16 configurations, the same set as `test_flash_attn_sched_gfx950.py`.
+  Every variant matches SDPA (atol/rtol 2e-2) and is bit-identical to the hand kernel.
+  The variants are `toggle`, `static (0,1)` and `static (1,0)`.
+* Timing: bf16, 7 interleaved rounds (the order rotates every round), 50 launches per
+  round, CUDA-event median per round; the table gives the median over rounds, with the
+  per-round range in brackets:
+
+  | shape (B,S,H,D) | hand | single program | 2prog toggle | 2prog static (0,1) | 2prog static (1,0) |
+  |---|---|---|---|---|---|
+  | 4,8192,64,128 | 7465 [7432-7487] | 7423 [7410-7463] | 7423 [7394-7460] | 7353 [7310-7382] | 7402 [7363-7432] |
+  | 16,8192,64,128 causal | 15299 [15276-15425] | 15250 [15238-15412] | 15346 [15331-15449] | 15175 [15167-15296] | 15287 [15260-15406] |
+  | 1,8192,32,64 | 687 [685-693] | 642 [640-643] | 642 [638-643] | 643 [641-643] | 649 [647-650] |
+
+  `toggle` matches the single program, as expected: it is the same code with the
+  runtime-predicated stagger barriers made static. `static (0,1)` is about 0.9% faster
+  at D=128 non-causal, where its round range does not overlap the single program's,
+  and about 0.5% faster causal, where the ranges overlap at the top. At D=64 it makes
+  no difference. One session, no pinned clocks: treat these as indications.
+
+## Register pins
+
+`flydsl.sched.pins` makes "this value lives in `v[a:b]`" schedule data. The
+semantics follow the AMDGPU named-register branch
+([yuyzhang512/llvm-project `amdgpu-named-reg-pin-std`](https://github.com/yuyzhang512/llvm-project/tree/amdgpu-named-reg-pin-std),
+tested at `583640bc5`): a pinned value has no storage of its own, and every
+read or write becomes `llvm.read_register` / `llvm.write_register` with the
+range as an `MDString` name.
+
+```python
+loop = Section("k", body.ops, loop=("k", rng), carried=("acc",))
+loop.pins = {"acc": "v[128:131]"}             # loop-carried: reserved for the whole function
+b.op("vmem_load", "load_x", outs=("x",), out_dwords={"x": 4}, pins={"x": "v[64:67]"})  # one definition
+```
+
+* `Section.pins` (loop-carried values): written before the loop and at the end of
+  every iteration, read at the top of every iteration and after the loop. The
+  read at the top is a live-in read, so the branch reserves the range for the
+  whole function.
+* `Op.pins` (one definition): written where the op defines it; every later read
+  of the value, until it is redefined, reads the range.
+* `kernels/attention/sched/mha_gfx950_pinned.py` builds a pinned variant of the
+  MHA schedule (presets `o` = `v_o` in `v[192:255]`, `ml` = `m_row`/`l_row`).
+
+**Verifier** (`pins.check`, run by `verify`): `PIN.SYNTAX`, `PIN.UNKNOWN_VALUE`,
+`PIN.WIDTH` (range width must equal the value's dwords from `out_dwords`; the branch
+rejects other names), `PIN.WIDTH_UNKNOWN`, `PIN.SPLIT` (a width with no register class,
+1/2/3/4/8/16 dwords for `v`, 1/2/4/8/16 for `a`: every leaf of the value takes
+consecutive sub-ranges), `PIN.OUT_OF_FILE` (`arch_vgpr_max_per_wave` /
+`acc_vgpr_max_per_wave`), `PIN.NO_AGPR`, `PIN.ALIGN` (`vgpr_tuple_alignment`),
+`PIN.ABI` (`v0` holds the work-item id at entry), `PIN.OVERLAP` (two pins sharing
+registers while both are live; a carried pin is live everywhere), `PIN.CARRIED_OP_PIN`
+(pin a carried value on its loop), `PIN.MULTI`, `PIN.RESERVED` (info: the range is
+reserved for the function), `PIN.BUDGET` (pins above the `waves_per_eu` budget),
+`PIN.ASYNC_SPILL` and `PIN.SCHED` (see below).
+
+**Lowering** (opt-in, no FlyDSL rebuild). `emit_program` wraps carried pins into its
+codecs (`pins.pin_codecs`), `lower.emit` reads/writes op pins (`pin_inputs` /
+`pin_outputs`). Each read or write is an inline-asm marker,
+`";flydsl.pin.write v[128:131]"` with a tied `"=v,0"` operand, which the stock
+toolchain compiles as a no-op. `tools/named_reg/named_reg.py` does the rest:
+
+```bash
+python3 tools/named_reg/named_reg.py prepare WS -- python3 bench.py   # dump + cache (inject_asm prepare)
+python3 tools/named_reg/named_reg.py build WS pin --llvm $PIN_LLVM/bin \
+    --llvm-opt enable-post-misched=false --llvm-opt lsr-drop-solution=true
+python3 tools/named_reg/named_reg.py run WS pin [-- other command]    # RUN_ONLY on the patched cache copy
+```
+
+`build` rewrites the markers of the dumped `NN_llvm_ir.ll`
+(`flydsl/compiler/named_reg.py:rewrite_markers`; `strip` removes them instead, `plain`
+keeps them), runs `opt -O2` and `llc -O2` for `amdgcn-amd-amdhsa`/`gfx950` with the
+kernel's `llvm_options` (not in the dump: pass them with `--llvm-opt`), links with
+`ld.lld -shared`, swaps the code object into a copy of the JIT cache entry
+(`inject_asm.replace_binary(code_object=...)`) and writes `report.json`: resources,
+the instruction count against FlyDSL's own ISA, `isa_pin_report` per range (writers,
+readers, in-place users, copies in/out = `PIN.INDIRECT`, by block) and
+`pending_lds_uses`. Kernels that call device libraries are refused. Any edit under
+`flydsl/compiler/` changes the JIT cache key, so prepare again after one.
+
+### Results (MI355X GPU 3, 2026-10-19)
+
+Pin LLVM: `583640bc544035fcc87177fee0410e0d87693919`, Release + assertions, AMDGPU only.
+FlyDSL 0.4.0 wheel `_mlir`, ROCm 7.2.4 container. Timing: CUDA-event median of 30 launches
+per process, processes interleaved over 5 rounds (3 for the low-register rows); the table gives
+the median of the round medians with the per-round range.
+
+* **Reproduction.** On unmodified IR the branch's `opt`+`llc` reproduces FlyDSL's MHA D=128
+  ISA instruction for instruction (2888/2888, same 244 VGPR / 96 SGPR). At D=64 it differs in
+  134 lines (mostly SGPR numbering in the prologue; 2248 vs 2244 instructions) with the same
+  time. The demo kernel reproduces exactly.
+* **Placement.** A 4-dword accumulator (`v_mfma_f32_16x16x32_bf16`) pinned to `v[8:11]`,
+  `v[128:131]` or `a[0:3]` is accumulated in place: the MFMA reads and writes the range,
+  the result is stored from it, no copies. A 16-dword accumulator (`32x32x16`) is not:
+  the branch copies it out of and back into the range around every MFMA (24 copies in,
+  40 out in the demo; `PIN.INDIRECT`). MHA `m_row`/`l_row` pinned to `v190`/`v191`: 3
+  copies in total. MHA D=64 `v_o` (32 dwords): 8 copies in / 16 out per 16-dword leaf.
+* **Branch limitation.** A 16-dword AGPR pin (`a[16:31]` with `v16i32`) aborts `llc` on
+  gfx942/gfx950 (`indirectCopyToAGPR`: "Expected GFX908 subtarget", from the SGPR-pair
+  copy of the zero initializer); 4 dwords work.
+* **Async loads.** MHA D=128 with `v_o` pinned (64 dwords) needs all 256 VGPRs and spills;
+  the spill code then stores destinations of inline-asm `ds_read_b64_tr_b16` before their
+  `lgkmcnt` wait (70 such instructions), and the result is wrong. The same happens without
+  pins when the stock compiler spills this kernel (`waves_per_eu=3`: 61 such instructions,
+  NaN), so it is the kernel's untracked async loads, not the pin. `PIN.ASYNC_SPILL` warns,
+  `pending_lds_uses` finds it on the ISA.
+
+| kernel (bf16) | variant | us | vs. stripped markers |
+|---|---|---|---|
+| MHA D=128 B4 S8192 H64 | FlyDSL / pin-llc plain | 7431.8 [7429.9-7435.5] / 7437.2 [7421.4-7441.8] | |
+| | `ml` stripped / pinned | 7436.4 [7434.2-7440.4] / 7454.8 [7453.1-7463.5] | +0.25% |
+| MHA D=64 B4 S8192 H32 | FlyDSL / pin-llc plain | 2373.2 [2372.5-2376.4] / 2373.5 [2372.9-2374.5] | |
+| | `v_o` stripped / `v[224:255]` / `v[32:63]` | 2373.5 [2369.1-2375.0] / 2525.6 [2519.9-2528.9] / 2523.4 [2521.9-2525.7] | +6.4% |
+| demo 16x16x32, 4096 blocks x 512 steps | stripped / `v[128:131]` / `v[8:11]` / `a[0:3]` | 762.6 / 855.3 / 760.9 / 761.6 | +12% at v128, 0 otherwise |
+| demo 32x32x16, same | stripped / `v[128:143]` | 776.2 [775.4-778.5] / 930.6 [929.8-933.5] | +20% |
+
+Round-to-round spread is about 0.1% for the MHA rows and 0.5% for the demo. The demo
+`v[128:131]` cost is occupancy (132 VGPRs: 3 waves instead of 8); the D=64 MHA cost is
+occupancy (164 -> 196/256 VGPRs, 3 -> 2 waves) plus the copies. Pin low registers, and pin
+32x32 accumulators only once the branch accumulates them in place.
+
+## Issue programs
+
+A `sched_group` interleave is a hint. LLVM fills what it can and schedules the rest
+itself. An issue program (`flydsl.sched.issue`) states the exact class order of one
+fence region, and its slot counts are checked against the instructions the region
+really produces:
+
+```python
+b.issue(group=1, gap=(3, 6))                      # template: MFMA spine, TRANS+VALU fillers
+b.issue("explicit", slots=[("mfma", 1), ("trans", 3), ...])
+sched, report = resolve(sched, calibration)       # -> exact sched_group_barrier chains
+```
+
+**Calibration.** `python -m flydsl.sched calibrate <final_isa.s> --schedule m:b --out c.json`
+counts, per op and per binding, the instructions each op produced. It reads them through
+the `emit(tag=...)` locations. Counts are *scheduler units*. After scheduling, LLVM unpacks
+`v_pk_{add,mul,fma}_f32` that sit in an MFMA's shadow into two VOP3 instructions. The
+group sizes count the packed op once, so the checker counts such a pair as one unit
+(`conform.mark_unpacked`). The raw count is kept as `raw:<class>` and used to balance gaps
+in issued instructions. Exact per-op counts (`by_op`) apply only to sections whose binding
+sequence matches the calibrated one; otherwise per-binding counts apply.
+
+**Template lowering.** The fillers are the region's own instructions, taken in op order.
+They are split into gaps of equal raw size after each spine instruction. When that would
+exceed `gap[1]`, the tail after the last spine instruction takes the rest. The result
+becomes a chain of `sched_group_barrier(mask, n, group)` calls, one per run of one class.
+Every groupable instruction then has exactly one slot, so LLVM's group solver has no
+slack.
+
+**Checks** (`ISSUE.*`, reported as `verify.Finding`s):
+- `UNCALIBRATED`: an op has no counts.
+- `CONTROL_FLOW`: an op branches. A chain acts inside one basic block.
+- `GAP`: the gap bounds are infeasible.
+- `DEPENDS`: a filler reads a spine op that issues after it, or a spine op reads a filler
+  that issues after it (transitive, through `ins`/`outs`).
+- `COUNT`: explicit slots do not match the counts.
+- `ASM`: inline-asm instructions in the region. No mask selects them, so they float.
+
+`python -m flydsl.sched issue m:b --arg issue=@c.json` prints the plans.
+
+`conform` reports `CONFORM.ISSUE` per program:
+- the requested and issued sequences, in units, with the first divergence;
+- the raw gaps between spine instructions, the back-to-back MFMAs, and the gaps outside
+  the bounds.
+
+**Why chains, not one instruction per fence.** The other option is emitting each slot
+between `sched_barrier(0)` fences from bindings that are streamed one instruction at a
+time. That needs every helper rewritten as a generator, and it removes LLVM's freedom
+inside a slot. The chains needed no helper changes. On the real ISA they reach the
+requested order exactly or to within one unit. Two other things did not work:
+- LLVM's exact solver (`amdgpu-igrouplp-exact-solver`) did not finish compiling the
+  kernel in 20 minutes.
+- Counting raw instructions instead of units made the groups run dry before the last
+  MFMAs, which left MFMAs back-to-back.
+
+**What the MHA needed** (`build_mha_schedule(..., p_cast="cvt", issue="default")`, D=128):
+- `p_cast="cvt"`: the inline-asm `v_cvt_pk_bf16_f32` of `cast_p` cannot be grouped.
+  `fptrunc` makes LLVM select the same instruction (bit-identical) inside the chain.
+- The PV clusters (C3/C7, E3/E7) are two issue regions each:
+  - PV step 0 with `reduce_max`;
+  - then the rescale, fenced off on its own. In the lazy variant it is a wave-uniform
+    branch, and an issue region must be one basic block;
+  - then steps 1-3 with `sub_m`/`exp2`.
+- `rescale="deferred"` is a branchless alternative. The lazy decision is a select, and
+  `O *= corr` moves to the next memory cluster under a uniform branch. Because the old
+  O is scaled after the PV that reads it, P needs no rescale. The output is
+  bit-identical whenever no lane rescales.
+- `CALIBRATION_D128` in `kernels/attention/sched/mha_gfx950.py` is the measured table.
+
+### Results (MI355X GPU 1, 2026-10-19)
+
+Environment as in *GPU check*. Shape: B=4 S=8192 H=64 D=128, bf16, non-causal.
+
+- **Conformance.** On the final ISA, every issue region has no back-to-back MFMA, with
+  3-6 instructions between consecutive MFMAs. In the loop the only larger gaps are
+  across the lazy branch (10, twice) and across the memory clusters. Before:
+  9 back-to-back pairs and gaps up to 44 inside compute clusters.
+- **Correctness.** The outputs are bit-identical to `flash_attn_gfx950.py`.
+  `tests/kernels/test_flash_attn_sched_gfx950.py` covers 3 shapes x causal/non-causal
+  x 3 variants; the full file passes (34 tests).
+- **Timing.** Six variants, 10 alternating rounds of 50 launches each, CUDA-event
+  median per round, unpinned clocks. A second build of the current kernel measured
+  +0.08%. Spread across rounds was 1.0-1.6%.
+
+| variant | median us | vs current emitted |
+|---|---|---|
+| hand `flash_attn_gfx950.py` | 7474.8 | +0.69% |
+| current emitted | 7423.8 | 0 |
+| issue programs in QK clusters only (`issue_split=False`) | 7395.2 | -0.39% |
+| issue programs in all compute clusters (lazy, split PV) | 7589.8 | +2.24% |
+| all clusters, deferred rescale | 7646.0 | +2.99% |
+
+The QK-cluster programs were -0.39 to -0.67% in four separate runs. Exact even spacing in
+the PV clusters is slower than LLVM's hint-driven order there, in both rescale variants.
+Without issue programs, the deferred rescale alone was +6.6 to +7.3%. Its hints were
+written for the lazy cluster shape. The ISA does not show which part of the PV order
+matters. Possible factors are the two extra fences around the rescale and the even
+placement of the `reduce_max` chain. Neither was measured separately.
