@@ -1,0 +1,69 @@
+{
+  "schema": "flydsl.sched.target/v1",
+  "arch": "gfx950",
+  "sku": "mi355x",
+  "doc": "Facts used by the flydsl.sched verifier / resource / cost analyzers. Every fact carries its source and a confidence level; an unknown value is null and the analyzers refuse to guess it.",
+  "sources": {
+    "cdna4-isa": "AMD Instinct CDNA4 Instruction Set Architecture reference guide",
+    "rocm-blog-occupancy-mi355x": "https://rocm.blogs.amd.com/software-tools-optimization/occupancy-math-mi355x/README.html",
+    "flydsl-rocdl": "python/flydsl/expr/rocdl/__init__.py (_SCHED_MASK_INT_TO_KW) and expr/rocdl/cdna3.py (s_waitcnt encoder)"
+  },
+  "facts": {
+    "wave_size":               {"value": 64,     "source": "cdna4-isa", "confidence": "documented"},
+    "simds_per_cu":            {"value": 4,      "source": "rocm-blog-occupancy-mi355x", "confidence": "documented"},
+    "max_waves_per_simd":      {"value": 8,      "source": "rocm-blog-occupancy-mi355x", "confidence": "documented"},
+    "num_cus":                 {"value": 256,    "source": "rocm-blog-occupancy-mi355x", "confidence": "documented"},
+    "peak_sclk_mhz":           {"value": 2400,   "source": "rocm-blog-occupancy-mi355x", "confidence": "documented"},
+    "hbm_bytes_per_s":         {"value": 8.0e12, "source": "rocm-blog-occupancy-mi355x", "confidence": "documented"},
+
+    "vgpr_file_per_lane":      {"value": 512,    "source": "rocm-blog-occupancy-mi355x", "confidence": "documented",
+                                "note": "arch VGPR + AccVGPR share one 512-entry budget per lane; each kind <= 256 per wave"},
+    "arch_vgpr_max_per_wave":  {"value": 256,    "source": "cdna4-isa", "confidence": "documented"},
+    "acc_vgpr_max_per_wave":   {"value": 256,    "source": "cdna4-isa", "confidence": "documented"},
+    "vgpr_alloc_granule":      {"value": 8,      "source": "llvm AMDGPU (gfx90a+ unified file)", "confidence": "inferred"},
+
+    "lds_bytes_per_cu":        {"value": 163840, "source": "cdna4-isa", "confidence": "documented"},
+    "lds_banks":               {"value": 64,     "source": "cdna4-isa", "confidence": "documented"},
+    "lds_bank_bytes":          {"value": 4,      "source": "cdna4-isa", "confidence": "documented"},
+
+    "counters": {"value": {
+        "vm":   {"max": 63, "in_order": true,  "tracks": ["buffer/global/flat load+store", "buffer_load ... lds (LDS DMA)"],
+                 "kinds": ["lds_dma", "vmem_load", "vmem_store"]},
+        "lgkm": {"max": 15, "in_order": true,  "tracks": ["ds_read/ds_write", "smem (out of order: only wait 0 is valid)"],
+                 "kinds": ["ds_read", "ds_read_tr", "ds_write", "smem"], "ooo_kinds": ["smem"]},
+        "exp":  {"max": 7,  "in_order": true,  "tracks": ["export / gds"]}
+      }, "source": "cdna4-isa", "confidence": "documented",
+      "note": "Same-type ops return in issue order; different types complete out of order. LDS DMA (buffer_load ... lds) is counted on vm and is NOT covered by the compiler's automatic waitcnt insertion."},
+
+    "mfma": {"value": {
+        "mfma_f32_32x32x16_bf16":    {"passes": 8,  "flops": 32768, "ab": "bf16", "confidence": "inferred",
+                                      "note": "pass count not printed for BF16 in the CDNA4 ISA; equal to F16 32x32x16 (8 passes)"},
+        "mfma_f32_32x32x16_f16":     {"passes": 8,  "flops": 32768, "ab": "f16",  "confidence": "documented"},
+        "mfma_f32_16x16x32_bf16":    {"passes": 4,  "flops": 16384, "ab": "bf16", "confidence": "inferred"},
+        "mfma_f32_16x16x32_f16":     {"passes": 4,  "flops": 16384, "ab": "f16",  "confidence": "documented"},
+        "mfma_f32_16x16x32_fp8_fp8": {"passes": 4,  "flops": 16384, "ab": "fp8",  "confidence": "documented"},
+        "mfma_f32_32x32x16_fp8_fp8": {"passes": 8,  "flops": 32768, "ab": "fp8",  "confidence": "documented"},
+        "mfma_f32_16x16x128_f8f6f4": {"passes": 8,  "flops": 65536, "ab": "fp8",  "confidence": "documented",
+                                      "note": "32 cycles when either operand is F8 (16 for F6/F4); operands in the F8F6F4 register layout"},
+        "mfma_f32_32x32x64_f8f6f4":  {"passes": 16, "flops": 131072, "ab": "fp8", "confidence": "documented",
+                                      "note": "64 cycles when either operand is F8 (32 for F6/F4)"}
+      }, "source": "cdna4-isa", "confidence": "documented"},
+    "mfma_cycles_per_pass":    {"value": 4, "source": "derived: 2.5 PFLOP/s bf16 dense = 256 CU x 4 SIMD x 2.4 GHz x 32768 flop / (8 passes x 4)",
+                                "confidence": "inferred"},
+
+    "sched_group_mask": {"value": {
+        "none": 0, "non_mem_non_sideeffect": 1, "valu": 2, "salu": 4, "mfma": 8, "all_vmem": 16, "vmem_read": 32,
+        "vmem_write": 64, "all_ds": 128, "ds_read": 256, "ds_write": 512, "trans": 1024, "ldsdma": 2048
+      }, "source": "flydsl-rocdl", "confidence": "documented"},
+
+    "supported_ops": {"value": ["mfma", "valu", "trans", "salu", "lds_dma", "vmem_load", "vmem_store", "ds_read", "ds_read_tr", "ds_write",
+                                "smem", "barrier", "wait", "sched_barrier", "sched_group", "setprio", "nop", "anchor", "stagger"],
+                      "source": "cdna4-isa", "confidence": "documented",
+                      "note": "no TDM, no WMMA, no split wait counters on gfx950"},
+
+    "latency_cycles": {"value": {
+        "ds_read_b128": null, "ds_read_tr16_b64": null, "buffer_load_lds_dwordx4": null, "s_barrier": null
+      }, "source": null, "confidence": "unknown",
+      "note": "not documented in the public ISA; fill from microbenchmarks (fly calib) before using as time"}
+  }
+}

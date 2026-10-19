@@ -427,6 +427,7 @@ setup(
             "_mlir_libs/libfly_*_aot_runtime.a",
             "*.pyi",
         ],
+        "flydsl.sched": ["targets/*.json"],
     },
     install_requires=_load_requirements(),
     cmdclass=({"bdist_wheel": bdist_wheel} if bdist_wheel is not None else {}),
