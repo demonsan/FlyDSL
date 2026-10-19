@@ -59,3 +59,56 @@ def test_sched_kernel_matches_sdpa_and_hand_kernel(B, S, H, D, dtype, causal):
     ref = _sdpa(q, k, v, causal).to(dtype)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
     assert torch.equal(out, ref_hand), "schedule-emitted kernel diverges from the hand-written kernel"
+
+
+# Issue-program variants (flydsl.sched.issue): exact MFMA/filler order, bf16 D=128 only
+# (the built-in calibration).  Same arithmetic as the hand kernel, so bit-identical outputs
+# are expected -- including "deferred", unless a lane's max grows past the lazy threshold.
+ISSUE_VARIANTS = {
+    "qk_clusters": dict(p_cast="cvt", issue="default", issue_split=False),
+    "all_clusters": dict(p_cast="cvt", issue="default"),
+    "deferred": dict(p_cast="cvt", issue="default", rescale="deferred"),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(ISSUE_VARIANTS))
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("B,S,H", [(1, 384, 8), (2, 1024, 8), (2, 700, 4)])
+def test_issue_program_variants_match_hand_kernel(B, S, H, causal, variant):
+    from kernels.attention.sched.mha_gfx950 import build_mha_schedule
+
+    D, dtype = 128, torch.bfloat16
+    torch.manual_seed(B * 7 + S + H + D)
+    q, k, v = (torch.randn(B, S, H, D, device="cuda", dtype=dtype) for _ in range(3))
+    sched = build_mha_schedule(D, causal, "bf16", **ISSUE_VARIANTS[variant])
+    kernel = build_flash_attn_sched_gfx950_module(H, D, causal=causal, dtype_str="bf16", schedule=sched)
+    out = torch.empty_like(q)
+    kernel(q, k, v, out, B, S)
+    ref_hand = torch.empty_like(q)
+    build_flash_attn_dualwave_swp_module(H, D, causal=causal, dtype_str="bf16")(q, k, v, ref_hand, B, S)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, _sdpa(q, k, v, causal).to(dtype), atol=2e-2, rtol=2e-2)
+    assert torch.equal(out, ref_hand), f"{sched.name} diverges from the hand-written kernel"
+
+
+# Per-group programs (Schedule.group_sections): each wave group runs its own copy of the
+# program, the phase offset is a barrier in code instead of the runtime stagger.
+@pytest.mark.parametrize("prio", ["toggle", "static"])
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("B,S,H,D", [(2, 1024, 8, 128), (1, 2048, 16, 64), (2, 700, 4, 128)])
+def test_two_program_variant_matches_hand_kernel(B, S, H, D, causal, prio):
+    from kernels.attention.sched.mha_gfx950_2prog import build_mha_2prog_schedule
+
+    dtype = torch.bfloat16
+    torch.manual_seed(B * 7 + S + H + D)
+    q, k, v = (torch.randn(B, S, H, D, device="cuda", dtype=dtype) for _ in range(3))
+    sched = build_mha_2prog_schedule(D, causal, "bf16", prio=prio)
+    kernel = build_flash_attn_sched_gfx950_module(H, D, causal=causal, dtype_str="bf16", schedule=sched)
+    assert kernel.verify_report.ok
+    out = torch.empty_like(q)
+    kernel(q, k, v, out, B, S)
+    ref_hand = torch.empty_like(q)
+    build_flash_attn_dualwave_swp_module(H, D, causal=causal, dtype_str="bf16")(q, k, v, ref_hand, B, S)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, _sdpa(q, k, v, causal).to(dtype), atol=2e-2, rtol=2e-2)
+    assert torch.equal(out, ref_hand), f"{sched.name} diverges from the hand-written kernel"

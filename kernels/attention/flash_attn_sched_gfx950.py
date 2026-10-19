@@ -18,8 +18,12 @@ kernel is built; a schedule with verifier errors is rejected.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.sched.lower import bindings_used
 from flydsl.sched.program import emit_program, schedule_fingerprint
@@ -32,9 +36,12 @@ from kernels.attention.flash_attn_utils import (
     DualwaveQLoader,
     DualwaveSoftmaxHelper,
     DualwaveStoreHelper,
+    _anchor_scalar_f32,
     _anchor_v_o,
     _anchor_v_p,
     _make_dualwave_swp_traits,
+    _pack_p_v8_slices,
+    _read_exec_i64,
     _s_barrier,
     _sched_barrier,
     _stagger_extra_barrier_if_one,
@@ -61,6 +68,52 @@ def _tile_resolver(ctx, bases):
         return base + ref.off if ref.off else base
 
     return resolve
+
+
+def _lazy_decide(traits, m_row, l_row, m_tile):
+    """Branchless lazy-rescale decision -> (m_row', l_row', corr).
+
+    Same arithmetic as ``DualwaveSoftmaxHelper.lazy_rescale_o``'s branch, as selects:
+    ``corr`` is exactly 1.0 (and ``m_row``/``l_row`` unchanged) unless some lane's tile
+    max exceeds its running max by more than the threshold.  ``corr`` is pinned so
+    LLVM does not fold ``O * select(c, 1, x)`` into a select over O.
+    """
+    m_row, l_row, m_tile = fx.Float32(m_row), fx.Float32(l_row), fx.Float32(m_tile)
+    below = fx.Float32(m_tile - m_row) <= fx.Float32(traits.DUALWAVE_SWP_RESCALE_THRESHOLD)
+    ballot = rocdl.ballot(T.i64, as_mlir_value(below))
+    all_below = fx.Int64(ballot) == fx.Int64(_read_exec_i64())
+    m_cand = fx.maxnumf(m_row, m_tile, fastmath=arith.FastMathFlags.nnan)
+    corr_c = rocdl.exp2(T.f32, as_mlir_value(m_row - m_cand))
+    corr = _anchor_scalar_f32(all_below.select(fx.Float32(1.0), corr_c))
+    m_new = all_below.select(m_row, m_cand)
+    return m_new, l_row * fx.Float32(corr), corr
+
+
+def _scale_o_if(traits, sm, v_o, corr):
+    """``O *= corr`` under a wave-uniform branch: skipped unless some lane rescaled (corr != 1)."""
+
+    @flyc.jit
+    def _run(v_o, corr):
+        o_out = [as_mlir_value(v_o[dc]) for dc in range_constexpr(traits.D_CHUNKS)]
+        need = rocdl.ballot(T.i64, as_mlir_value(fx.Float32(corr) != fx.Float32(1.0)))
+        if fx.Int64(need) != fx.Int64(0):
+            scaled = list(v_o)
+            sm.scale_o(scaled, corr)
+            o_out = [as_mlir_value(scaled[dc]) for dc in range_constexpr(traits.D_CHUNKS)]
+        return o_out
+
+    return _run(v_o, corr)
+
+
+def _cast_p_cvt(traits, v_p, elem):
+    """``cast_p`` without inline asm: ``fptrunc`` lets LLVM select ``v_cvt_pk_bf16_f32`` itself,
+    so sched_group_barrier VALU masks can place the instructions (same rounding: RNE)."""
+
+    def pack(vals):
+        v = Vec.from_elements([fx.Float32(x) for x in vals], fx.Float32)
+        return llvm.FPTruncOp(Vec.make_type(8, elem), as_mlir_value(v)).result
+
+    return _pack_p_v8_slices(traits, v_p, pack)
 
 
 def _require_dense(ctx):
@@ -135,7 +188,12 @@ def build_flash_attn_sched_gfx950_module(
         raise ValueError(f"schedule {sched.name} uses ops this kernel does not implement: {missing}")
     _check_loop_shape(sched)
     # The JIT cache must distinguish transformed schedules with the same name.
-    cache_tag = (traits.cache_tag, sched.name, schedule_fingerprint(sched))
+    cache_tag = (
+        traits.cache_tag,
+        sched.name,
+        schedule_fingerprint(sched),
+        tuple(sorted(sched.meta.get("llvm_options", {}).items())),
+    )
 
     lds_elem = dtype_to_elem_type(traits.DTYPE_STR)
 
@@ -236,6 +294,11 @@ def build_flash_attn_sched_gfx950_module(
             "stagger_open": _stagger_open,
             "stagger_close": _stagger_close,
             "store_o": lambda v_o, m_row, l_row: store.store_final_o(v_o, ctx.q_row, m_row, l_row),
+            # issue-program variants (build_mha_schedule(rescale="deferred", p_cast="cvt"))
+            "lazy_decide": lambda m_row, l_row, m_tile: _lazy_decide(traits, m_row, l_row, m_tile),
+            "unit_corr": lambda: fx.Float32(1.0),
+            "cast_p_cvt": lambda p: _cast_p_cvt(traits, p, elem),
+            "scale_o_if": lambda v_o, corr: _scale_o_if(traits, sm, v_o, corr),
         }
 
         def tile_of(extra):
@@ -251,6 +314,7 @@ def build_flash_attn_sched_gfx950_module(
             loop_bounds=lambda name: (fx.Index(3), ctx.split_t_end - fx.Index(1), fx.Index(2)),
             codecs=_CARRY_CODECS,
             tag=sched.name,  # op -> ISA attribution; only visible with FLYDSL_DEBUG_ENABLE_DEBUG_INFO
+            group_id=ctx.stagger_i32,  # wave-group id; used only by per-group programs
         )
 
     @flyc.jit
@@ -295,7 +359,8 @@ def build_flash_attn_sched_gfx950_module(
     compile_hints = {
         "fast_fp_math": True,
         "unsafe_fp_math": True,
-        "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True},
+        # a schedule may add backend options (e.g. the sched_group solver its issue programs need)
+        "llvm_options": {"enable-post-misched": False, "lsr-drop-solution": True, **sched.meta.get("llvm_options", {})},
     }
 
     def _launch(

@@ -22,6 +22,8 @@ flash_attn_sched_gfx950.py`` emits a kernel from it and ``flydsl.sched``
 verifies / costs it without a GPU.
 """
 
+from typing import Optional, Tuple
+
 from flydsl.sched.ir import Buffer, Builder, Queue, Schedule, Section, SlotUse, T
 
 BLOCK_M = 256
@@ -59,8 +61,34 @@ KERNEL_BINDINGS = frozenset(
         "sub_m", "exp2", "reduce_sum", "cast_p", "anchor_p", "anchor_o", "lazy_rescale_o", "rescale_o",
         "rescale_from_tile_max", "apply_l_rescale", "scale_o", "normalize", "init_acc", "stagger_open",
         "stagger_close", "store_o",
+        # issue-program variants (rescale="deferred", p_cast="cvt")
+        "lazy_decide", "unit_corr", "cast_p_cvt", "scale_o_if",
     }
 )  # fmt: skip
+
+# Instructions per binding (D=128, bf16, gfx950) in scheduler units, measured with
+# ``python -m flydsl.sched calibrate`` on the final ISA of
+# ``build_mha_schedule(128, False, rescale="deferred", p_cast="cvt", issue=...)``
+# (B=4 S=8192 H=64, MI355X, ROCm 7.2.4 image, flydsl 0.4.0 wheel _mlir, 2026-10-19).
+# ``raw:valu``: instructions after LLVM unpacks v_pk_*_f32 in MFMA shadows.  The packed
+# v_cvt_pk_bf16_f32 of ``cast_p_cvt`` carry ``anchor_p``'s location, hence its 16 VALU.
+# Only the bindings that occur inside issue regions are listed (by_binding form).
+CALIBRATION_D128 = {
+    "by_binding": {
+        "qk": {"mfma": 16},
+        "exp2": {"trans": 16},
+        "reduce_sum": {"nop": 1, "raw:valu": 35, "valu": 20},
+        "cast_p_cvt": {},
+        "anchor_p": {"valu": 16},
+        "pv_step": {"mfma": 4},
+        "to_lists": {},
+        "reduce_max": {"nop": 1, "valu": 19},
+        "sub_m": {"raw:valu": 28, "valu": 16},
+        "lazy_decide": {"salu": 2, "trans": 1, "valu": 6},
+        "rescale_from_tile_max": {"trans": 1, "valu": 2},
+        "apply_l_rescale": {},
+    }
+}
 
 
 def _pairs(head_dim: int, pairs: int) -> int:
@@ -75,7 +103,46 @@ def build_mha_schedule(
     lazy_rescale: bool = True,
     setprio: bool = True,
     stagger: bool = True,
+    rescale: Optional[str] = None,
+    p_cast: str = "asm",
+    issue=None,
+    issue_gap: Tuple[int, int] = (3, 6),
+    issue_split: bool = True,
+    corr_apply: str = "branch",
 ) -> Schedule:
+    """``rescale``: "lazy" (wave-uniform branch inside the PV cluster, the hand kernel's),
+    "eager" (rescale O and P every tile) or "deferred" (branchless lazy decision in the PV
+    cluster; ``O *= corr`` in the following memory cluster, after the PV MFMAs that read
+    the old O).  Default: "lazy" if ``lazy_rescale`` else "eager".
+
+    ``p_cast``: "asm" packs P with inline-asm ``v_cvt_pk_bf16_f32`` (invisible to
+    sched_group masks); "cvt" lets LLVM select the instruction.
+
+    ``issue``: a ``flydsl.sched.issue.Calibration`` (or its dict form, or "default" for
+    ``CALIBRATION_D128``).  The QK/softmax clusters (``finish_p``: C1/C5, E1/E5/E9) and,
+    with ``issue_split`` (default), the PV clusters get template issue programs (MFMA
+    spine, TRANS+VALU fillers, ``issue_gap`` instructions between MFMAs) instead of
+    sched_group hints; ``issue_split=False`` keeps the hints in the PV clusters.  The
+    programs are resolved here; one that does not fit is an error.  ``issue`` needs
+    ``p_cast="cvt"`` (asm casts cannot be grouped, so the gaps would be too small).
+
+    ``corr_apply`` (deferred only): "branch" skips ``O *= corr`` under a wave-uniform
+    branch in the memory cluster when nothing rescaled, "always" multiplies.
+    """
+    if isinstance(issue, str):
+        if issue != "default" or head_dim != 128:
+            raise ValueError(f"issue={issue!r}: only 'default' (CALIBRATION_D128, head_dim=128) is built in")
+        issue = CALIBRATION_D128
+    rescale = rescale or ("lazy" if lazy_rescale else "eager")
+    if rescale not in ("lazy", "eager", "deferred"):
+        raise ValueError(f"rescale must be lazy|eager|deferred, got {rescale!r}")
+    if p_cast not in ("asm", "cvt"):
+        raise ValueError(f"p_cast must be asm|cvt, got {p_cast!r}")
+    if corr_apply not in ("branch", "always"):
+        raise ValueError(f"corr_apply must be branch|always, got {corr_apply!r}")
+    lazy_rescale = rescale == "lazy"
+    deferred = rescale == "deferred"
+    cast_binding = "cast_p" if p_cast == "asm" else "cast_p_cvt"
     g = mha_geometry(head_dim)
     KS, DC, NDMA = g["K_STEPS_QK"], g["D_CHUNKS"], g["NUM_DMA"]
     mfma = MFMA[dtype]
@@ -174,7 +241,7 @@ def build_mha_schedule(
 
     # per-lane dwords of VALU results whose size depends on the producer:
     # P is f32 (2 x 16 dwords) out of exp2 and bf16 (2 x 2 packs x 4 dwords) after cast_p.
-    SIZES = {"cast_p": 16, "exp2": 32, "scale_q": 4 * KS}
+    SIZES = {"cast_p": 16, "cast_p_cvt": 16, "exp2": 32, "scale_q": 4 * KS}
 
     def valu(b, binding, ins, outs, kind="valu", **args):
         d = SIZES.get(binding)
@@ -198,16 +265,24 @@ def build_mha_schedule(
         """C1/C5 tail: second half of exp2, row sum, bf16 cast, anchor, interleave."""
         valu(b, "exp2", (p,), (p,), kind="trans", start=16, length=16)
         valu(b, "reduce_sum", ("l_row", p), ("l_row",))
-        valu(b, "cast_p", (p,), (p,))
+        valu(b, cast_binding, (p,), (p,))
         b.anchor("anchor_p", (p,), (p,))
-        b.interleave(P(6), "trans", 3, group)
-        b.interleave(P(10), "valu", 5, group)
+        if issue is not None:
+            b.issue(group=group, gap=issue_gap)
+        else:
+            b.interleave(P(6), "trans", 3, group)
+            b.interleave(P(10), "valu", 5, group)
 
-    def mem_cluster(b, issue, read, wait_vm):
+    def mem_cluster(b, dma, read, wait_vm, apply_corr=False):
         b.nop(7)
         b.sched_barrier(0)
-        issue(b)
+        dma(b)
         read(b)
+        if apply_corr and deferred:
+            # the previous PV cluster's MFMAs (which read the old O) have been issued.  A memory
+            # cluster has no issue program, so a wave-uniform branch here costs nothing when
+            # no lane rescaled (the common case); "always" multiplies unconditionally.
+            valu(b, "scale_o_if" if corr_apply == "branch" else "scale_o", ("v_o", "corr"), ("v_o",))
         b.wait(lgkm=0)
         b.wait(vm=wait_vm)
         b.barrier()
@@ -216,23 +291,50 @@ def build_mha_schedule(
         """C3/C7: P*V with the online-softmax rescale threaded between the 4 PV steps."""
         if setprio:
             b.setprio(1)
+        # With issue programs the cluster becomes two issue regions.  deferred: PV steps 0-1
+        # under the max/decide chain, steps 2-3 under sub_m/exp2.  lazy/eager: PV step 0
+        # under reduce_max, then the rescale (lazy: a wave-uniform branch) fenced off in a
+        # region of its own -- an issue region must be one basic block -- then steps 1-3
+        # under sub_m/exp2.
+        pv_issue = issue is not None and (issue_split or deferred)
+        split = pv_issue and issue_split
         pv(b, 0, p_in, tile=v_tile)
+        if split and deferred:
+            pv(b, 1, p_in)
         if s_to_lists:
             valu(b, "to_lists", (s_in,), (s_in,))
         valu(b, "reduce_max", (s_in,), (tmax,))
-        b.interleave(P(4), "valu", 6, group_a)
-        valu(
-            b,
-            "lazy_rescale_o" if lazy_rescale else "rescale_o",
-            ("v_o", "m_row", "l_row", tmax, p_in),
-            ("v_o", "m_row", "l_row", p_in),
-        )
-        for step in (1, 2, 3):
+        if not pv_issue:
+            b.interleave(P(4), "valu", 6, group_a)
+        if deferred:
+            # branchless: corr = 1 unless some lane's max grew past the threshold; O *= corr
+            # happens in the next memory cluster, so P (already at the old max) needs no rescale
+            valu(b, "lazy_decide", ("m_row", "l_row", tmax), ("m_row", "l_row", "corr"))
+            if split:
+                b.issue(group=group_a, gap=issue_gap)
+                b.sched_barrier(0)
+        else:
+            if split:
+                b.issue(group=group_a, gap=issue_gap)
+                b.sched_barrier(0)
+            valu(
+                b,
+                "lazy_rescale_o" if lazy_rescale else "rescale_o",
+                ("v_o", "m_row", "l_row", tmax, p_in),
+                ("v_o", "m_row", "l_row", p_in),
+            )
+            if split:
+                b.sched_barrier(0)
+        for step in (2, 3) if split and deferred else (1, 2, 3):
             pv(b, step, p_in)
         valu(b, "sub_m", (s_in, "m_row"), (s_in,))
         valu(b, "exp2", (s_in,), (p_out,), kind="trans", start=0, length=16)
-        b.interleave(P(6), "valu", group_b[0], group_b[1])
-        b.interleave(P(6), "trans", 3, group_b[1])
+        if pv_issue:
+            # lead=1: one filler before the first MFMA bridges the sched_barrier of the split
+            b.issue(group=group_b[1], gap=issue_gap, lead=1 if split and deferred else 0)
+        else:
+            b.interleave(P(6), "valu", group_b[0], group_b[1])
+            b.interleave(P(6), "trans", 3, group_b[1])
         if setprio:
             b.setprio(0)
         b.barrier()
@@ -265,16 +367,22 @@ def build_mha_schedule(
     pro.barrier()
     load_k(pro, T("first", 2), 0)
     valu(pro, "init_acc", (), ("l_row", "v_o"))
+    if deferred:
+        valu(pro, "unit_corr", (), ("corr",))
 
     # ---- steady state: two KV tiles per iteration, 8 clusters ----------------------
     lp = Builder()
-    mem_cluster(lp, lambda b: load_v(b, T("j", -2), 1), lambda b: read_k(b, 1, T("j", -2)), 2 * NDMA)  # C0
+    mem_cluster(
+        lp, lambda b: load_v(b, T("j", -2), 1), lambda b: read_k(b, 1, T("j", -2)), 2 * NDMA, apply_corr=True
+    )  # C0
     qk(lp, "v_s1", T("j", -2))  # C1
     finish_p(lp, "v_p0", 1)
     lp.barrier()
     mem_cluster(lp, lambda b: load_k(b, T("j"), 1), lambda b: read_v(b, 0, T("j", -3)), 2 * NDMA)  # C2
     pv_cluster(lp, "v_p0", "v_p1", "v_s1", "m_tile", T("j", -3), 2, (6, 2), s_to_lists=True)  # C3
-    mem_cluster(lp, lambda b: load_v(b, T("j", -1), 0), lambda b: read_k(b, 0, T("j", -1)), 2 * NDMA)  # C4
+    mem_cluster(
+        lp, lambda b: load_v(b, T("j", -1), 0), lambda b: read_k(b, 0, T("j", -1)), 2 * NDMA, apply_corr=True
+    )  # C4
     qk(lp, "v_s0", T("j", -1))  # C5
     finish_p(lp, "v_p1", 3)
     lp.barrier()
@@ -288,7 +396,9 @@ def build_mha_schedule(
 
     # ---- epilogue: drain the last three tiles --------------------------------------
     ep = Builder()
-    mem_cluster(ep, lambda b: load_v(b, T("end", -3), 1), lambda b: read_k(b, 1, T("end", -3)), 2 * NDMA)  # E0
+    mem_cluster(
+        ep, lambda b: load_v(b, T("end", -3), 1), lambda b: read_k(b, 1, T("end", -3)), 2 * NDMA, apply_corr=True
+    )  # E0
     qk(ep, "v_s1", T("end", -3))  # E1
     finish_p(ep, "v_p0", 5)
     ep.barrier()
@@ -306,13 +416,27 @@ def build_mha_schedule(
         """E3/E7/E11 head: full P*V, then the unconditional rescale of the new tile."""
         if setprio:
             b.setprio(1)
-        pv_all(b, p_in, "v_v", v_tile)
-        valu(b, "reduce_max", (s_in,), ("m_tile",))
-        valu(b, "rescale_from_tile_max", ("m_row", "m_tile"), ("m_row", "rescale"))
-        valu(b, "sub_m", (s_in, "m_row"), (s_in,))
-        valu(b, "exp2", (s_in,), (p_out,), kind="trans", start=0, length=16)
-        b.interleave(P(10), "valu", 5, group)
-        b.interleave(P(6), "trans", 3, group)
+        if issue is not None:
+            # two regions like the loop's PV clusters, with PV as four steps; the max/rescale
+            # chain is shorter here (no decision), so it covers only PV step 0
+            pv(b, 0, p_in, tile=v_tile)
+            valu(b, "reduce_max", (s_in,), ("m_tile",))
+            valu(b, "rescale_from_tile_max", ("m_row", "m_tile"), ("m_row", "rescale"))
+            b.issue(group=group, gap=issue_gap)
+            b.sched_barrier(0)
+            for step in (1, 2, 3):
+                pv(b, step, p_in)
+            valu(b, "sub_m", (s_in, "m_row"), (s_in,))
+            valu(b, "exp2", (s_in,), (p_out,), kind="trans", start=0, length=16)
+            b.issue(group=group, gap=issue_gap, lead=1)
+        else:
+            pv_all(b, p_in, "v_v", v_tile)
+            valu(b, "reduce_max", (s_in,), ("m_tile",))
+            valu(b, "rescale_from_tile_max", ("m_row", "m_tile"), ("m_row", "rescale"))
+            valu(b, "sub_m", (s_in, "m_row"), (s_in,))
+            valu(b, "exp2", (s_in,), (p_out,), kind="trans", start=0, length=16)
+            b.interleave(P(10), "valu", 5, group)
+            b.interleave(P(6), "trans", 3, group)
         b.sched_barrier(0)
         valu(b, "scale_o", ("v_o", "rescale"), ("v_o",))
         b.anchor("anchor_o", ("v_o",), ("v_o",))
@@ -412,8 +536,18 @@ def build_mha_schedule(
             "hbm_bytes_unique": batch * (2 * heads * seq_q + 2 * kv_heads * seq_kv) * head_dim * 2,
         }
 
-    return Schedule(
-        name=f"mha_fwd_dualwave_gfx950_d{head_dim}_{'causal' if causal else 'full'}_{dtype}",
+    variant = "".join(
+        s
+        for s, on in (
+            ("_deferred", deferred),
+            ("_always", deferred and corr_apply == "always"),
+            ("_eager", rescale == "eager"),
+            ("_cvt", p_cast == "cvt"),
+        )
+        if on
+    ) + ("_issue" if issue is not None else "")
+    sched = Schedule(
+        name=f"mha_fwd_dualwave_gfx950_d{head_dim}_{'causal' if causal else 'full'}_{dtype}{variant}",
         target="gfx950",
         buffers={
             "lK": Buffer("lK", "lds", "K", 2, g["K_TILE_BYTES"]),
@@ -431,7 +565,7 @@ def build_mha_schedule(
                 "loop",
                 lp.ops,
                 loop=("j", lambda b: range(b["first"] + 3, b["end"] - 1, 2)),
-                carried=("m_row", "l_row", "v_o", "v_p0"),
+                carried=("m_row", "l_row", "v_o", "v_p0") + (("corr",) if deferred else ()),
             ),
             Section("epilogue", ep.ops),
         ],
@@ -461,6 +595,7 @@ def build_mha_schedule(
                 "l_row": 1,
                 "m_tile": 1,
                 "rescale": 1,
+                "corr": 1,
                 "v_p0": 32,
                 "v_p1": 32,
             },
@@ -472,3 +607,13 @@ def build_mha_schedule(
             ],
         },
     )
+    if issue is None:
+        return sched
+    from flydsl.sched.issue import Calibration, resolve
+
+    calib = issue if isinstance(issue, Calibration) else Calibration.from_dict(issue)
+    resolved, report = resolve(sched, calib)
+    if not report.ok:
+        raise ValueError(f"{sched.name}: issue programs do not fit:\n{report.render(verbose=False)}")
+    resolved.meta = dict(sched.meta, issue_report=report)
+    return resolved
