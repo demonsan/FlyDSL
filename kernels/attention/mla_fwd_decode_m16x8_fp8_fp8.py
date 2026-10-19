@@ -11,6 +11,12 @@ Architecture: 8 warps / 512 threads, persistent-thread dispatch.
 Default path: BLOCK_N=32, software V transpose through Vt LDS.
 gfx950 path: BLOCK_N=64, V3 KV LDS layout, ds_read_b64_tr_b8 for V.
 
+On gfx950 the two hot loops -- GEMM1 (QK^T with the next tile's DMA
+interleaved) and the GEMM2 PV core -- are emitted from the Schedule IR in
+``kernels/attention/sched/mla_gfx950.py`` (``gemm1_ops`` / ``gemm2_core_ops``);
+that module also describes the whole work item so ``flydsl.sched`` can
+verify and cost it without a GPU.
+
 NOTE: Do NOT use ``from __future__ import annotations`` here -- it breaks
 ``fx.Constexpr`` detection in the FlyDSL AST rewriter.
 """
@@ -26,6 +32,8 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.runtime.device import get_rocm_arch
+from flydsl.sched.lower import emit
+from kernels.attention.sched import mla_gfx950 as mla_sched
 from kernels.common import buffer_ops
 from kernels.common.kernels_common import LOG2E
 
@@ -1018,14 +1026,44 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
                     check_boundary=check_boundary_next,
                 )
 
-        # ---- Prefetch block 0 of next tile (inline asm, opaque to LLVM) ----
-        _maybe_prefetch(0)
-
-        # ---- GEMM1: QK attention scores ----
         P_COMP_SUBS = BLOCK_N // MFMA_N
         p_comp = [c_zero_v4f32] * P_COMP_SUBS
+        if const_expr(IS_GFX950):
+            # ---- GEMM1 + interleaved next-tile prefetch, emitted from the Schedule IR ----
+            q_tab = {"nope": q_nope, "rope": q_rope}
 
-        for nope_pair in range_constexpr(NUM_NOPE_ITERS):
+            def _prefetch_pass(block, pass_idx):
+                row_p0_next, row_p1_next = row_kv_ld_next
+                _prefetch_k_tile_asm(
+                    p_lds_kv_next_warp,
+                    row_p0_next if pass_idx == 0 else row_p1_next,
+                    kv_ld_col_base_arg,
+                    block,
+                    pass_idx=pass_idx,
+                    check_boundary=check_boundary_next,
+                )
+
+            g1_env = {}
+            emit(
+                mla_sched.gemm1_ops(prefetch=do_prefetch),
+                {
+                    "read_k": lambda row_offset, col_offset: _load_k_from_lds(k_base_i32, row_offset, col_offset),
+                    "prefetch_kv": _prefetch_pass,
+                    "qk_mfma": lambda k, *acc, q_kind, q_idx: _mfma_fp8(
+                        T.f32x4, [k, q_tab[q_kind][q_idx], acc[0] if acc else c_zero_v4f32, 0, 0, 0]
+                    ),
+                },
+                g1_env,
+            )
+            p_comp = [g1_env[f"p{h}"] for h in range_constexpr(P_COMP_SUBS)]
+
+        # ---- Prefetch block 0 of next tile (inline asm, opaque to LLVM) ----
+        if const_expr(not IS_GFX950):
+            _maybe_prefetch(0)
+
+        # ---- GEMM1: QK attention scores ----
+        # Hand-written schedule for the default (non-gfx950) path; zero trips on gfx950.
+        for nope_pair in range_constexpr(0 if IS_GFX950 else NUM_NOPE_ITERS):
             tile_0 = nope_pair * 2
             tile_1 = nope_pair * 2 + 1
 
@@ -1054,7 +1092,7 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
             for h in range_constexpr(P_COMP_SUBS):
                 p_comp[h] = _mfma_fp8(T.f32x4, [k1[h], q_1, p_comp[h], 0, 0, 0])
 
-        for rope_pair in range_constexpr(NUM_ROPE_ITERS):
+        for rope_pair in range_constexpr(0 if IS_GFX950 else NUM_ROPE_ITERS):
             tile_0 = rope_pair * 2
             tile_1 = rope_pair * 2 + 1
 
@@ -1072,7 +1110,8 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
             for h in range_constexpr(P_COMP_SUBS):
                 p_comp[h] = _mfma_fp8(T.f32x4, [k1[h], q_rope[tile_1], p_comp[h], 0, 0, 0])
 
-        rocdl.s_setprio(14)
+        if const_expr(not IS_GFX950):  # gfx950: the schedule ends with s_setprio 14
+            rocdl.s_setprio(14)
 
         # ---- Extract p_comp values for softmax ----
         p_vals = []
@@ -1156,8 +1195,28 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
     def _gemm2_core(p_pack, oaccu, vt_base_i32):
         """GEMM2 PV accumulation loop (shared by first-iter and rescale paths)."""
         K_HALVES = BLOCK_N // 32
-        rocdl.s_setprio(15)
-        for pv_pair in range_constexpr(NUM_PV_ITERS // 2):
+        if const_expr(IS_GFX950):
+            # gfx950: emitted from the Schedule IR (8 V reads per PV pair, drained 2 at a time).
+            p_lo, p_hi = p_pack
+            g2_env = {"p_lo": p_lo, "p_hi": p_hi}
+            for i in range_constexpr(NUM_PV_ITERS * 2):
+                g2_env[f"o{i}"] = oaccu[i]
+            emit(
+                mla_sched.gemm2_core_ops(),
+                {
+                    "read_v_tr": lambda row_offset, col_offset: _load_v_tr_from_lds(
+                        vt_base_i32, row_offset, col_offset
+                    ),
+                    "v_swap": _v_swap_pair,
+                    "pv_mfma": lambda lhs, p, acc: _mfma_fp8(T.f32x4, [lhs, p, acc, 0, 0, 0]),
+                },
+                g2_env,
+            )
+            oaccu = [g2_env[f"o{i}"] for i in range_constexpr(NUM_PV_ITERS * 2)]
+        else:
+            rocdl.s_setprio(15)
+        # Hand-written schedule for the default (non-gfx950) path; zero trips on gfx950.
+        for pv_pair in range_constexpr(0 if IS_GFX950 else NUM_PV_ITERS // 2):
             iter_a = pv_pair * 2
             iter_b = pv_pair * 2 + 1
             col_a_strip = iter_a * MFMA_N * 2
@@ -1218,7 +1277,8 @@ def kn_mla_fwd_decode_m16x8_fp8_fp8(
             if const_expr(pv_pair < NUM_PV_ITERS // 2 - 1):
                 rocdl.s_nop(1)
 
-        rocdl.s_setprio(0)
+        if const_expr(not IS_GFX950):  # gfx950: the schedule ends with s_setprio 0
+            rocdl.s_setprio(0)
         return oaccu
 
     def _gemm2_first_iter(p_pack, vt_base_i32):
