@@ -1612,6 +1612,13 @@ class FallbackLocations(Transformer):
         # Floor location for un-decorated (bare) MLIR ops written directly in a
         # kernel/jit body. Decorated primitives override this via their own
         # capture_user_location() scope; ops with an explicit loc= are unaffected.
+        # Inside an already captured location (a decorated primitive, or a
+        # ``flydsl.sched.lower.emit(tag=...)`` op) keep it: it is captured once.
+        from ..expr import meta
+
+        if getattr(meta._tls, "active_loc", None) is not None:
+            yield
+            return
         with file_location(filename, line, col):
             yield
 
