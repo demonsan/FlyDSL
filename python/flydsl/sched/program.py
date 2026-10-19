@@ -64,11 +64,17 @@ def schedule_fingerprint(sched: Schedule) -> str:
     import hashlib
 
     h = hashlib.sha256()
-    for sec in sched.sections:
-        h.update(repr((sec.name, sec.loop is not None, tuple(sec.carried))).encode())
-        for op in sec.ops:
-            args = tuple(sorted((k, str(v)) for k, v in op.args.items()))
-            h.update(repr((op.kind, op.binding, op.ins, op.outs, args, op.count)).encode())
+    programs = [sched.sections] if sched.group_sections is None else sched.group_sections
+    for g, secs in enumerate(programs):
+        if sched.group_sections is not None:
+            h.update(f"group {g}".encode())
+        for sec in secs:
+            pins = sorted((k, str(v)) for k, v in (getattr(sec, "pins", None) or {}).items())  # regpin
+            h.update(repr((sec.name, sec.loop is not None, tuple(sec.carried), pins)).encode())
+            for op in sec.ops:
+                args = tuple(sorted((k, str(v)) for k, v in op.args.items()))
+                op_pins = sorted((k, str(v)) for k, v in (getattr(op, "pins", None) or {}).items())
+                h.update(repr((op.kind, op.binding, op.ins, op.outs, args, op.count, op_pins)).encode())
     return h.hexdigest()[:16]
 
 
@@ -81,6 +87,8 @@ def emit_program(
     codecs: Optional[Mapping[str, Codec]] = None,
     sections: Optional[Sequence[str]] = None,
     loop_impl: Optional[Callable] = None,
+    group_id=None,
+    dispatch: Optional[Callable] = None,
     **emit_kw,
 ) -> MutableMapping[str, object]:
     """Lower every section of ``sched`` in order.
@@ -90,12 +98,60 @@ def emit_program(
     runtime ``(start, stop, step)`` of a loop section.  ``loop_impl(start, stop, step,
     init, body)`` builds the loop (default: ``scf.for``); ``body(iv, args) -> new args``.
     ``emit_kw`` is forwarded to :func:`flydsl.sched.lower.emit` (``target``, ``primitives``, ...).
+
+    Per-group programs (``sched.group_sections``) need ``group_id``, a wave-uniform value
+    holding the wave's group: every group's program is emitted in its own branch of
+    ``dispatch(group_id, branches)`` (default: an ``scf.if`` chain), each on a copy of ``env``.
     """
     if sched.program is not None:
         raise ValueError(f"{sched.name}: tile-count dependent programs cannot be emitted as one loop nest")
     env = {} if env is None else env
     codecs = codecs or {}
-    for sec in sched.sections:
+    from .pins import pin_codecs  # loop-carried register pins (no-op without Section.pins)
+
+    codecs = pin_codecs(sched, codecs)
+    if sched.group_sections is not None:
+        if group_id is None:
+            raise ValueError(f"{sched.name}: per-group programs need the wave's group id (group_id=...)")
+        branches = [
+            _group_branch(secs, bindings, env, tile_of, loop_bounds, codecs, sections, loop_impl, emit_kw)
+            for secs in sched.group_sections
+        ]
+        (dispatch or scf_group_dispatch)(group_id, branches)
+        return env
+    _emit_sections(sched.sections, bindings, env, tile_of, loop_bounds, codecs, sections, loop_impl, emit_kw)
+    return env
+
+
+def _group_branch(secs, bindings, env, tile_of, loop_bounds, codecs, sections, loop_impl, emit_kw):
+    def branch():
+        _emit_sections(secs, bindings, dict(env), tile_of, loop_bounds, codecs, sections, loop_impl, emit_kw)
+
+    return branch
+
+
+def scf_group_dispatch(group_id, branches):
+    """``if group_id == 0: branches[0]() elif ...`` as nested ``scf.if`` (no results)."""
+    import flydsl.expr as fx
+    from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
+
+    def chain(g):
+        if g == len(branches) - 1:
+            branches[g]()
+            return
+        cond = fx.Int32(group_id) == fx.Int32(g)
+        ReplaceIfWithDispatch.scf_if_dispatch(cond, branches[g], lambda: chain(g + 1))
+
+    chain(0)
+
+
+def python_group_dispatch(group_id, branches):
+    """Run the branch of ``group_id`` eagerly (CPU interpretation / tests)."""
+    branches[group_id]()
+
+
+def _emit_sections(secs, bindings, env, tile_of, loop_bounds, codecs, sections, loop_impl, emit_kw):
+    for sec in secs:
         if sections is not None and sec.name not in sections:
             continue
         kw = dict(emit_kw, section=sec.name) if emit_kw.get("tag") is not None else emit_kw
@@ -103,7 +159,6 @@ def emit_program(
             emit(sec.ops, bindings, env, tile_of({}), **kw)
         else:
             _emit_loop(sec, bindings, env, tile_of, loop_bounds(sec.name), codecs, kw, loop_impl or scf_loop)
-    return env
 
 
 def scf_loop(start, stop, step, init, body):

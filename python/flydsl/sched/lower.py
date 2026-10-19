@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from typing import Callable, Dict, Mapping, MutableMapping, Optional, Sequence
 
 from .ir import Op, Section, TileRef
+from .pins import pin_inputs, pin_outputs
 from .target import TargetDesc, load_target
 
 
@@ -173,6 +174,8 @@ def _emit_one(op: Op, prim, bindings, env, tile, trace):
         prim.setprio(op.args["prio"])
     elif k == "nop":
         prim.nop(op.args["n"], op.args.get("asm", True))
+    elif k == "issue":
+        raise ValueError(f"unresolved issue program {op}: run flydsl.sched.issue.resolve(schedule, calibration) first")
     else:
         _call(op, bindings, env, tile)
 
@@ -188,23 +191,22 @@ def _call(op: Op, bindings: Mapping[str, Callable], env: MutableMapping[str, obj
         raise KeyError(f"op {op} reads undefined values {missing}")
     # stagger's phase is already in its binding name (stagger_open / stagger_close)
     args = {} if op.kind == "stagger" else {k: _resolve(v, tile) for k, v in op.args.items()}
-    result = fn(*[env[n] for n in op.ins], **args)
-    if not op.outs:
-        return
+    result = fn(*pin_inputs(op, env), **args)
     if len(op.outs) == 1:
         env[op.outs[0]] = result
-        return
-    if not isinstance(result, (tuple, list)) or len(result) != len(op.outs):
-        raise ValueError(f"binding {op.binding!r} must return {len(op.outs)} values for {op.outs}")
-    for name, value in zip(op.outs, result):
-        env[name] = value
+    elif op.outs:
+        if not isinstance(result, (tuple, list)) or len(result) != len(op.outs):
+            raise ValueError(f"binding {op.binding!r} must return {len(op.outs)} values for {op.outs}")
+        for name, value in zip(op.outs, result):
+            env[name] = value
+    pin_outputs(op, env)
 
 
 def bindings_used(ops: Sequence[Op]) -> Dict[str, int]:
     """Bindings a kernel must provide for ``ops`` (name -> use count)."""
     out: Dict[str, int] = {}
     for op in ops:
-        if op.kind in ("wait", "barrier", "sched_barrier", "sched_group", "setprio", "nop"):
+        if op.kind in ("wait", "barrier", "sched_barrier", "sched_group", "setprio", "nop", "issue"):
             continue
         out[op.binding] = out.get(op.binding, 0) + 1
     return out

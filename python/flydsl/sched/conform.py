@@ -121,6 +121,9 @@ class Inst:
     section: Optional[str] = None  # schedule section, when src is a sched: tag
     op: Optional[int] = None  # 0-based schedule op index
     tag: Optional[str] = None
+    # 0 for the second half of an unpacked packed-FP32 op (see ``mark_unpacked``): one
+    # instruction for LLVM's scheduler (and sched_group sizes), two in the final ISA
+    unit: int = 1
 
     @property
     def where(self) -> str:
@@ -247,7 +250,43 @@ def parse_isa(text: str, kernel: Optional[str] = None) -> IsaKernel:
         insts.append(inst)
     if state == "before":
         raise ValueError(f"kernel label {kernel}: not found")
+    mark_unpacked(insts)
     return IsaKernel(kernel, insts, meta, tags)
+
+
+# FP32 VOP3 ops that LLVM's pre-emit peephole produces by unpacking V_PK_{ADD,MUL,FMA}_F32
+# inside an MFMA's shadow (after scheduling, so sched_group sizes count the packed op once)
+_UNPACKABLE = ("v_add_f32_e64", "v_mul_f32_e64", "v_fma_f32")
+_VREG = re.compile(r"^v(\d+)$")
+
+
+def mark_unpacked(insts: List[Inst]) -> None:
+    """Mark the second instruction of each unpacked pair (``unit = 0``).
+
+    A pair is two adjacent identical FP32 VOP3 ops whose destination registers are
+    ``vN``/``vN+1`` and whose sources are the next register or the same operand.  That
+    is how an unpacked ``v_pk_*_f32`` looks; it is a heuristic, so it is only used for
+    counting units, never for correctness checks.
+    """
+    for a, b in zip(insts, insts[1:]):
+        if a.unit == 0 or a.mnemonic != b.mnemonic or a.mnemonic not in _UNPACKABLE or a.asm or b.asm:
+            continue
+        oa = [t.strip() for t in a.operands.split(",")]
+        ob = [t.strip() for t in b.operands.split(",")]
+        if len(oa) != len(ob) or len(oa) < 2:
+            continue
+        ra, rb = _VREG.match(oa[0]), _VREG.match(ob[0])
+        if not (ra and rb and int(rb.group(1)) == int(ra.group(1)) + 1):
+            continue
+        ok = True
+        for x, y in zip(oa[1:], ob[1:]):
+            mx, my = _VREG.match(x), _VREG.match(y)
+            if x == y or (mx and my and int(my.group(1)) == int(mx.group(1)) + 1):
+                continue
+            ok = False
+            break
+        if ok:
+            b.unit = 0
 
 
 def read_isa(path: str, kernel: Optional[str] = None) -> IsaKernel:
@@ -675,13 +714,59 @@ def _check_interleave(rep, sec, ops, regions, insts):
         ks = [k for k, op in enumerate(ops) if regions[k] == r]
         in_region = [i for i in insts if regions[i.op] == r]
         by_block: Dict[str, List[int]] = defaultdict(list)
+        programs: Dict[str, List[int]] = defaultdict(list)
         for k in ks:
             if ops[k].kind == "sched_group":
+                if "issue" in ops[k].args:
+                    programs[ops[k].args["issue"]["id"]].append(k)
+                    continue
                 b = _group_block(k, in_region)
                 if b is not None:
                     by_block[b].append(k)
         for main, gks in by_block.items():
             _interleave_one(rep, sec, ops, r, gks, main, in_region)
+        for pid, gks in programs.items():
+            _issue_one(rep, sec, ops, r, pid, gks, in_region)
+
+
+def _issue_one(rep, sec, ops, r, pid, gks, in_region):
+    """``issue`` program (resolved into sched_group ops) against the instructions actually issued.
+
+    Requested: the program's slot sequence over its grouped classes.  Achieved: the
+    region's instructions of those classes, in the block the chain acts on.  Gaps count
+    every instruction (free ones too) between consecutive spine instructions.
+    """
+    prog = ops[gks[0]].args["issue"]
+    main = _group_block(gks[0], in_region)
+    if main is None:
+        return
+    spine = prog["spine"]
+    classes = {spine} | set(prog["fill"])
+    request = [c for c, n in prog["slots"] for _ in range(n)]
+    block = [i for i in in_region if i.block == main]
+    # compared in scheduler units: an unpacked v_pk_*_f32 pair counts once (see mark_unpacked)
+    achieved = [i.cls for i in block if i.cls in classes and not i.asm and i.unit]
+    first = next((p for p, (a, b) in enumerate(zip(request, achieved)) if a != b), None)
+    if first is None and len(request) != len(achieved):
+        first = min(len(request), len(achieved))
+    pos = [p for p, i in enumerate(block) if i.cls == spine]
+    gaps = [b - a - 1 for a, b in zip(pos, pos[1:])]  # raw: every instruction issued in between
+    lo, hi = prog["gap"]
+    b2b = sum(g == 0 for g in gaps)
+    outside = [g for g in gaps if not lo <= g <= hi]
+    exact = first is None
+    msg = (
+        f"{sec}/{pid} in block {main}: requested {_rle(request)}; issued {_rle(achieved)} (units); "
+        + ("exact" if exact else f"diverges at slot {first} of {len(request)}")
+        + (
+            f"; {len(pos)} {spine}, raw gaps {min(gaps)}..{max(gaps)} (every instruction), "
+            f"{b2b} back-to-back, {len(outside)} outside {lo}..{hi}"
+            if gaps
+            else f"; {len(pos)} {spine}"
+        )
+    )
+    sev = "info" if exact and not outside else "warn"
+    rep.add(("ISSUE", sec, pid), Finding("CONFORM.ISSUE", sev, msg, where=f"{sec}/{pid}"))
 
 
 def _interleave_one(rep, sec, ops, r, gks, main, in_region):

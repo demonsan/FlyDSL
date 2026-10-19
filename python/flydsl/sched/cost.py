@@ -53,6 +53,9 @@ class CostReport:
     estimate: Optional[dict] = None
     unknown: List[str] = field(default_factory=list)
     hints: List[str] = field(default_factory=list)
+    # per-group programs: group -> {"clusters", "mfma_cycles_per_iter", "loop_offset"}; ``loop_clusters`` and
+    # ``mfma_cycles_per_iter_per_wave`` then describe the busiest group (it bounds the wave pair)
+    groups: Dict[int, dict] = field(default_factory=dict)
 
     @property
     def mfma_cycles_per_tile_per_wave(self):
@@ -69,6 +72,12 @@ class CostReport:
             lines.append(
                 f"    C{c.index:<2d} {c.role:8s} mfma {c.mfma:3d} ({c.mfma_cycles:5d} cyc)  "
                 f"dma {c.dma:2d}  ds_read {c.ds_read:3d}  {c.label}"
+            )
+        for g, info in sorted(self.groups.items()):
+            lines.append(
+                f"  group {g}: {len(info['clusters'])} clusters, {info['mfma_cycles_per_iter']} MFMA cyc/iter/wave, "
+                f"loop starts after {info['loop_offset']} barrier(s): "
+                + " ".join(f"C{c.index}:{c.role[0]}" for c in info["clusters"])
             )
         if self.phases:
             lines.append("  dual-wave phases (group A cluster | group B cluster on the same SIMD):")
@@ -149,6 +158,69 @@ def _clusters(ops: List[Op], target: TargetDesc) -> List[Cluster]:
     return out
 
 
+def _phase(k: int, a: Cluster, b: Cluster) -> dict:
+    both = bool(a.mfma_cycles) and bool(b.mfma_cycles)
+    none = not a.mfma_cycles and not b.mfma_cycles
+    return {
+        "phase": k,
+        "a": a.index,
+        "b": b.index,
+        "mfma_cycles": a.mfma_cycles + b.mfma_cycles,
+        "status": "contended" if both else ("idle" if none else "ok"),
+    }
+
+
+def _barriers(ops: List[Op], sched: Schedule, g: int) -> int:
+    """Barriers group ``g`` executes in ``ops`` (stagger ops count as in the verifier)."""
+    n = 0
+    for op in ops:
+        if op.kind == "barrier":
+            n += 1
+        elif op.kind == "stagger":
+            phase = op.args["phase"]
+            n += not sched.stagger or (phase == "open" and g == 1) or (phase == "close" and g == 0)
+    return n
+
+
+def _group_loops(sched: Schedule, target: TargetDesc, rep: CostReport):
+    """Per-group programs: clusters per group, and the dual-wave pairing of their merged barrier phases.
+
+    Group ``g``'s loop cluster ``k`` runs in barrier phase ``offset_g + it * n + k`` (``offset_g``: barriers
+    before its loop, ``n``: barriers per iteration), so in group 0's slot ``k`` group 1 runs its cluster
+    ``(k + offset_0 - offset_1) mod n``.  The pairing is only static when both loops cross the same number
+    of barriers per iteration.
+    """
+    for g in range(sched.groups):
+        secs = sched.sections_of(g)
+        li = next((i for i, s in enumerate(secs) if s.loop is not None), None)
+        loop = secs[li] if li is not None else secs[0]
+        before = [op for s in secs[: li or 0] for op in s.ops]
+        clusters = _clusters(loop.ops, target)
+        rep.groups[g] = {
+            "clusters": clusters,
+            "mfma_cycles_per_iter": sum(c.mfma_cycles for c in clusters),
+            "loop_offset": _barriers(before, sched, g),
+            "barriers_per_iter": _barriers(loop.ops, sched, g),
+            "ops": loop.ops,
+        }
+    busiest = max(rep.groups, key=lambda g: rep.groups[g]["mfma_cycles_per_iter"])
+    rep.loop_clusters = rep.groups[busiest]["clusters"]
+    rep.mfma_cycles_per_iter_per_wave = rep.groups[busiest]["mfma_cycles_per_iter"]
+    if sched.groups != 2:
+        return
+    a, b = rep.groups[0], rep.groups[1]
+    n = a["barriers_per_iter"]
+    if n != b["barriers_per_iter"] or n != len(a["clusters"]) or n != len(b["clusters"]):
+        rep.hints.append(
+            f"group loops cross {a['barriers_per_iter']} vs {b['barriers_per_iter']} barriers per iteration "
+            f"({len(a['clusters'])} vs {len(b['clusters'])} clusters): no static dual-wave pairing"
+        )
+        return
+    shift = a["loop_offset"] - b["loop_offset"]
+    for k in range(n):
+        rep.phases.append(_phase(k, a["clusters"][k], b["clusters"][(k + shift) % n]))
+
+
 def estimate_cost(sched: Schedule, shape: Optional[dict] = None, target: Optional[TargetDesc] = None) -> CostReport:
     target = target or load_target(sched.target)
     loop = next((s for s in sched.sections if s.loop is not None), sched.sections[0])
@@ -157,23 +229,18 @@ def estimate_cost(sched: Schedule, shape: Optional[dict] = None, target: Optiona
     tiles_per_iter = int(sched.meta.get("loop_tiles_per_iter", 1))
     rep = CostReport(sched.name, target.key, clusters, per_iter, tiles_per_iter)
     rep.unknown = sorted(k for k, v in (target.fact("latency_cycles").value or {}).items() if v is None)
-    rep.hints = _mfma_rate_hints(loop.ops, target)
+    if sched.group_sections is not None:
+        _group_loops(sched, target, rep)
+        rep.hints = _mfma_rate_hints([op for info in rep.groups.values() for op in info["ops"]], target) + rep.hints
+        for info in rep.groups.values():
+            del info["ops"]
+    else:
+        rep.hints = _mfma_rate_hints(loop.ops, target)
 
-    if sched.groups == 2 and sched.stagger and clusters:
+    if sched.group_sections is None and sched.groups == 2 and sched.stagger and clusters:
         n = len(clusters)
         for k in range(n):
-            a, b = clusters[k], clusters[(k - 1) % n]
-            both = bool(a.mfma_cycles) and bool(b.mfma_cycles)
-            none = not a.mfma_cycles and not b.mfma_cycles
-            rep.phases.append(
-                {
-                    "phase": k,
-                    "a": a.index,
-                    "b": b.index,
-                    "mfma_cycles": a.mfma_cycles + b.mfma_cycles,
-                    "status": "contended" if both else ("idle" if none else "ok"),
-                }
-            )
+            rep.phases.append(_phase(k, clusters[k], clusters[(k - 1) % n]))
 
     workload = sched.meta.get("workload")
     if shape is not None and workload is not None:

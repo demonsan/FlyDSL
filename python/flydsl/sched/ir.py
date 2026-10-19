@@ -29,6 +29,14 @@ MEMORY_KINDS = ("lds_dma", "vmem_load", "vmem_store", "ds_read", "ds_read_tr", "
 CONTROL_KINDS = ("wait", "barrier", "sched_barrier", "sched_group", "setprio", "nop", "stagger", "anchor")
 ALL_KINDS = COMPUTE_KINDS + MEMORY_KINDS + CONTROL_KINDS
 
+# ---- issue programs (flydsl.sched.issue) ------------------------------------------------
+# An ``issue`` op states the exact instruction-class order of its fence region;
+# ``issue.resolve`` replaces it with a sched_group chain before verify/emit.
+ISSUE_KIND = "issue"
+CONTROL_KINDS = CONTROL_KINDS + (ISSUE_KIND,)
+ALL_KINDS = ALL_KINDS + (ISSUE_KIND,)
+# ---- end issue programs ------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class TileRef:
@@ -103,6 +111,11 @@ class Op:
     out_dwords: Dict[str, int] = field(default_factory=dict)  # per-lane VGPR dwords of each out
     consumes: Tuple[Tuple[str, TileRef], ...] = ()  # (tensor, tile) consumed by this compute op
     note: str = ""
+    # ---- register pins (flydsl.sched.pins) ----------------------------------------------------
+    # out -> physical register range ("v[64:79]", "a[0:15]"): this definition lives in that range
+    # and every later read of it reads the range (see flydsl.sched.pins).
+    pins: Dict[str, str] = field(default_factory=dict)
+    # ---- end register pins ----------------------------------------------------------------------
 
     def __str__(self):
         return self.label or f"{self.kind}:{self.binding}"
@@ -121,6 +134,11 @@ class Section:
     ops: List[Op]
     loop: Optional[Tuple[str, Callable[[Dict[str, int]], range]]] = None  # (var, bases -> range)
     carried: Tuple[str, ...] = ()
+    # ---- register pins (flydsl.sched.pins) ----------------------------------------------------
+    # carried value -> register range it lives in across the whole loop (read at the top of the
+    # body, written at its end); the range is reserved for the whole function.
+    pins: Dict[str, str] = field(default_factory=dict)
+    # ---- end register pins ----------------------------------------------------------------------
 
 
 @dataclass
@@ -140,6 +158,41 @@ class Schedule:
     valid_tiles: Callable[[int], bool] = lambda n: n >= 1
     tensors: Dict[str, str] = field(default_factory=dict)  # tensor -> "every tile consumed once by <binding>"
     meta: Dict[str, object] = field(default_factory=dict)
+    # ---- per-group programs (owner: groups) ------------------------------------------------
+    # ``group_sections[g]`` is the program wave group ``g`` runs (buffers and queues are shared).
+    # ``None``: every group runs ``sections``.  When set, ``sections`` is ``group_sections[0]``,
+    # so tools that look at one program see group 0's.
+    group_sections: Optional[List[List["Section"]]] = None
+
+    def __post_init__(self):
+        if self.group_sections is not None:
+            if len(self.group_sections) != self.groups:
+                raise ValueError(f"{self.name}: {len(self.group_sections)} group programs for {self.groups} groups")
+            if self.program is not None:
+                raise ValueError(f"{self.name}: per-group programs cannot also be tile-count dependent")
+            self.sections = self.group_sections[0]
+
+    def sections_of(self, group: int, n_tiles: Optional[int] = None) -> List[Section]:
+        """The sections wave group ``group`` runs (for ``n_tiles`` when the program depends on it)."""
+        if self.group_sections is not None:
+            return self.group_sections[group]
+        if self.program is not None and n_tiles is not None:
+            return self.program(n_tiles)
+        return self.sections
+
+    def all_sections(self) -> List[Section]:
+        """Every distinct section of every group's program."""
+        if self.group_sections is None:
+            return list(self.sections)
+        seen, out = set(), []
+        for secs in self.group_sections:
+            for s in secs:
+                if id(s) not in seen:
+                    seen.add(id(s))
+                    out.append(s)
+        return out
+
+    # ---- end per-group programs ------------------------------------------------------------
 
     def section(self, name: str) -> Section:
         for s in self.sections:
@@ -148,7 +201,7 @@ class Schedule:
         raise KeyError(f"{self.name}: no section {name!r}")
 
     def all_ops(self) -> List[Op]:
-        return [op for s in self.sections for op in s.ops]
+        return [op for s in self.all_sections() for op in s.ops]
 
 
 class Builder:
@@ -234,3 +287,17 @@ class Builder:
     def extend(self, ops: Sequence[Op]):
         for op in ops:
             self._add(op)
+
+    # ---- issue programs (flydsl.sched.issue) --------------------------------------------
+    def issue(self, mode: str = "template", *, group: int = 0, label: str = "", **program):
+        """Exact issue order of this fence region (see ``flydsl.sched.issue``).
+
+        template: ``spine="mfma", fill=("trans", "valu"), gap=(3, 6), lead=0``;
+        explicit: ``slots=[("mfma", 1), ("trans", 3), ...]``.
+        """
+        from .issue import issue_args
+
+        args = issue_args(mode, group=group, **program)
+        return self._add(Op(kind=ISSUE_KIND, label=label or f"issue[{group}] {mode}", args=args, count=0))
+
+    # ---- end issue programs --------------------------------------------------------------

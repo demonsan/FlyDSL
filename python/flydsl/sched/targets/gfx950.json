@@ -21,6 +21,8 @@
     "arch_vgpr_max_per_wave":  {"value": 256,    "source": "cdna4-isa", "confidence": "documented"},
     "acc_vgpr_max_per_wave":   {"value": 256,    "source": "cdna4-isa", "confidence": "documented"},
     "vgpr_alloc_granule":      {"value": 8,      "source": "llvm AMDGPU (gfx90a+ unified file)", "confidence": "inferred"},
+    "vgpr_tuple_alignment":    {"value": 2,      "source": "llvm AMDGPU GCNSubtarget::needsAlignedVGPRs (gfx90a and later)", "confidence": "documented",
+                                "note": "VGPR/AGPR tuples of 64 bits or more must start at an even register"},
 
     "lds_bytes_per_cu":        {"value": 163840, "source": "cdna4-isa", "confidence": "documented"},
     "lds_banks":               {"value": 64,     "source": "cdna4-isa", "confidence": "documented"},

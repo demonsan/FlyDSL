@@ -10,6 +10,8 @@ Commands
   show       the op list of one section (or every section)
   target     the target description, with sources and confidence
   conform    check a final ISA (*_final_isa.s) against its schedule; --against diffs two ISAs
+  calibrate  per-binding instruction counts from a tagged final ISA (--schedule, --out file.json)
+  issue      resolved issue programs of a schedule (slots, gaps, findings); --calib for unresolved ones
 
 Examples
   python -m flydsl.sched check  kernels.attention.sched.mha_gfx950:build_mha_schedule --arg head_dim=64
@@ -35,6 +37,10 @@ def _kv(text):
     out = {}
     for item in filter(None, (text or "").split(",")):
         k, v = item.split("=", 1)
+        if v.startswith("@"):  # k=@file.json: the JSON file's content (e.g. issue=@calibration.json)
+            with open(v[1:], encoding="utf-8") as f:
+                out[k] = json.load(f)
+            continue
         try:
             out[k] = json.loads(v.lower() if v in ("True", "False") else v)
         except json.JSONDecodeError:
@@ -69,9 +75,53 @@ def _conform(a):
     return rc
 
 
+# ---- issue programs (calibrate / issue) ---------------------------------------------------
+def _calibrate(a):
+    from .conform import read_isa
+    from .issue import calibrate
+
+    if not a.schedule:
+        print("calibrate needs --schedule module:builder (the schedule the ISA was emitted from)")
+        return 2
+    cal = calibrate(read_isa(a.spec, a.kernel), _load(a.schedule, a.arg), a.tag, source=a.spec)
+    if a.out:
+        with open(a.out, "w", encoding="utf-8") as f:
+            json.dump(cal.to_dict(), f, indent=1, sort_keys=True)
+    if a.json:
+        print(json.dumps(cal.to_dict(), indent=1, sort_keys=True))
+        return 0
+    for b, c in sorted(cal.by_binding.items()):
+        var = f"   (varies: {cal.varies[b]})" if b in cal.varies else ""
+        print(f"{b:24s} {' '.join(f'{k}={v}' for k, v in sorted(c.items()))}{var}")
+    return 0
+
+
+def _issue(a):
+    from .issue import ISSUE_KIND, Calibration, resolve
+
+    sched = _load(a.spec, a.arg)
+    report = sched.meta.get("issue_report")
+    if any(op.kind == ISSUE_KIND for op in sched.all_ops()):
+        if not a.calib:
+            print("schedule has unresolved issue programs; pass --calib calibration.json")
+            return 2
+        with open(a.calib, encoding="utf-8") as f:
+            sched, report = resolve(sched, Calibration.from_dict(json.load(f)))
+    if report is None:
+        print(f"{sched.name}: no issue programs")
+        return 0
+    print(report.to_json() if a.json else report.render(verbose=True))
+    return 0 if report.ok else 1
+
+
+# ---- end issue programs -------------------------------------------------------------------
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="python -m flydsl.sched", description=__doc__.split("\n\n")[0])
-    p.add_argument("command", choices=["check", "resource", "cost", "show", "target", "conform"])
+    p.add_argument("command", choices=["check", "resource", "cost", "show", "target", "conform", "calibrate", "issue"])
+    p.add_argument("--out", help="'calibrate': write the calibration JSON here")
+    p.add_argument("--calib", help="'issue': calibration JSON for unresolved issue programs")
     p.add_argument("spec", help="module:builder for a schedule, an arch for 'target', an ISA file for 'conform'")
     p.add_argument("--schedule", help="module:builder of the schedule the ISA was emitted from ('conform')")
     p.add_argument("--against", help="second ISA file to diff against ('conform'; A = --against, B = spec)")
@@ -97,6 +147,10 @@ def main(argv=None):
         return 0
     if a.command == "conform":
         return _conform(a)
+    if a.command == "calibrate":
+        return _calibrate(a)
+    if a.command == "issue":
+        return _issue(a)
 
     sched = _load(a.spec, a.arg)
     if a.command == "check":

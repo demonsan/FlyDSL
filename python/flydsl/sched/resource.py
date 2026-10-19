@@ -23,6 +23,8 @@ class ResourceReport:
     vgpr_budget: Optional[int]  # per wave at the schedule's waves_per_eu
     waves_per_eu: Optional[int]
     notes: List[str] = field(default_factory=list)
+    # per-group programs: group -> live peak of that group's program (the report's peak is the max)
+    vgpr_per_group: Dict[int, int] = field(default_factory=dict)
 
     @property
     def fits(self):
@@ -45,9 +47,9 @@ class ResourceReport:
         return "\n".join(lines)
 
 
-def _vgpr_live_peak(sched: Schedule, n_tiles: int):
-    """Peak of the sum of declared value sizes over def..last-use intervals."""
-    events = trace(sched, n_tiles)
+def _vgpr_live_peak(sched: Schedule, n_tiles: int, group: int = 0):
+    """Peak of the sum of declared value sizes over def..last-use intervals (in ``group``'s program)."""
+    events = trace(sched, n_tiles, group)
     default = dict(sched.meta.get("value_dwords", {}))
     intervals = []  # (start, end, dwords, name) -- one per definition
     open_def: Dict[str, tuple] = {}  # name -> (start, dwords)
@@ -82,7 +84,17 @@ def estimate_resources(sched: Schedule, target: Optional[TargetDesc] = None, n_t
     if sched.meta.get("lds_extra_bytes"):
         lds_buffers["other"] = int(sched.meta["lds_extra_bytes"])
     n = n_tiles or max(sched.meta.get("verify_tiles", (4,)))
-    peak, where, unsized = _vgpr_live_peak(sched, n)
+    per_group: Dict[int, int] = {}
+    if sched.group_sections is None:
+        peak, where, unsized = _vgpr_live_peak(sched, n)
+    else:  # registers are per wave: the budget must hold the hungriest group's program
+        peak, where, unsized = 0, "", []
+        for g in range(sched.groups):
+            p, w, u = _vgpr_live_peak(sched, n, g)
+            per_group[g] = p
+            unsized = sorted(set(unsized) | set(u))
+            if p > peak or not where:
+                peak, where = p, f"g{g}:{w}"
     wpe = sched.meta.get("waves_per_eu")
     budget = None
     notes = []
@@ -99,6 +111,8 @@ def estimate_resources(sched: Schedule, target: Optional[TargetDesc] = None, n_t
     notes.append("VGPR figure counts declared schedule values only; addresses, masks and temporaries come on top")
     if unsized:
         notes.append(f"values without a declared size: {', '.join(unsized)}")
+    if per_group:
+        notes.append("per-group live peaks: " + ", ".join(f"group {g} {p}" for g, p in sorted(per_group.items())))
     return ResourceReport(
         schedule=sched.name,
         target=target.key,
@@ -110,4 +124,5 @@ def estimate_resources(sched: Schedule, target: Optional[TargetDesc] = None, n_t
         vgpr_budget=budget,
         waves_per_eu=wpe,
         notes=notes,
+        vgpr_per_group=per_group,
     )
