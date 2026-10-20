@@ -112,8 +112,8 @@ class Op:
     consumes: Tuple[Tuple[str, TileRef], ...] = ()  # (tensor, tile) consumed by this compute op
     note: str = ""
     # ---- register pins (flydsl.sched.pins) ----------------------------------------------------
-    # out -> physical register range ("v[64:79]", "a[0:15]"): this definition lives in that range
-    # and every later read of it reads the range (see flydsl.sched.pins).
+    # out -> register range ("v[64:79]", "a[0:3]", "s10"; strict, or "v[64:79] soft"): a register
+    # allocation hint at this definition (see flydsl.sched.pins).
     pins: Dict[str, str] = field(default_factory=dict)
     # ---- end register pins ----------------------------------------------------------------------
 
@@ -135,8 +135,8 @@ class Section:
     loop: Optional[Tuple[str, Callable[[Dict[str, int]], range]]] = None  # (var, bases -> range)
     carried: Tuple[str, ...] = ()
     # ---- register pins (flydsl.sched.pins) ----------------------------------------------------
-    # carried value -> register range it lives in across the whole loop (read at the top of the
-    # body, written at its end); the range is reserved for the whole function.
+    # carried value -> register range hinted wherever the loop defines or receives it (initial
+    # value, top of the body, end of the body, loop result); see flydsl.sched.pins.
     pins: Dict[str, str] = field(default_factory=dict)
     # ---- end register pins ----------------------------------------------------------------------
 

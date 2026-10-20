@@ -4,14 +4,15 @@
 
 """Small pin demo: an MFMA accumulation loop whose accumulator is pinned to a register range.
 
-Every block (one wave) accumulates ``steps`` bf16 32x32x16 MFMAs into one f32x16
-accumulator per lane and stores it.  The kernel body is emitted from a Schedule IR
+Every block (one wave) accumulates ``steps`` bf16 MFMAs (32x32x16 or 16x16x32) into one
+f32 accumulator per lane and stores it.  The kernel body is emitted from a Schedule IR
 whose loop carries ``acc``; ``--pin v[128:143]`` pins it (``Section.pins``), which
-``flydsl.sched.program.emit_program`` lowers to pin markers.  With the stock
-toolchain the markers are no-ops; ``tools/named_reg/named_reg.py`` turns them into
-named-register intrinsics.
+``flydsl.sched.program.emit_program`` lowers to ``rocdl.sched.{vgpr,agpr}`` allocation
+hints (strict; ``--soft`` for advisory) at the initial value, the top and the end of the
+loop body and the loop result.
 
-    python tools/named_reg/demo_mfma_acc.py --pin v[128:143] [--bench]
+    python tools/named_reg/demo_mfma_acc.py --shape 16x16x32 --pin v[128:131] [--soft] [--bench 30]
+    FLYDSL_DUMP_IR=1 ... ; python tools/named_reg/isa_report.py <dump>/*_final_isa.s v[128:131]
 
 Checks the result against a torch reference (fp32 matmul of the same fragments).
 """
@@ -54,7 +55,7 @@ def build_schedule(pin=None, shape="32x32x16") -> Schedule:
     if pin:
         loop.pins = {"acc": pin}
     return Schedule(
-        name=f"demo_mfma_acc_{shape}" + ("_pinned" if pin else ""),
+        name=f"demo_mfma_acc_{shape}" + (f"_pin_{pin}".replace(" ", "_") if pin else ""),
         target="gfx950",
         buffers={},
         queues={"gld": Queue("gld", "vm", tracked=True)},
@@ -152,12 +153,14 @@ def bench(fn, iters):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--pin", default=os.environ.get("DEMO_PIN") or None)
+    ap.add_argument("--soft", action="store_true", help="advisory instead of strict hint")
     ap.add_argument("--blocks", type=int, default=2048)
     ap.add_argument("--steps", type=int, default=256)
     ap.add_argument("--shape", choices=sorted(SHAPES), default="32x32x16")
     ap.add_argument("--bench", type=int, default=0, help="timed iterations (0: correctness only)")
     args = ap.parse_args(argv)
-    sched = build_schedule(args.pin, args.shape)
+    pin = f"{args.pin} soft" if args.pin and args.soft else args.pin
+    sched = build_schedule(pin, args.shape)
     launch = build_kernel(sched, args.shape)
     m, acc_dw = SHAPES[args.shape]
     torch.manual_seed(0)

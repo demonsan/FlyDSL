@@ -398,121 +398,125 @@ the `flydsl==0.4.0` wheel's `_mlir` with this branch's Python, clocks not pinned
 
 ## Register pins
 
-`flydsl.sched.pins` makes "this value lives in `v[a:b]`" schedule data. The
-semantics follow the AMDGPU named-register branch
-([yuyzhang512/llvm-project `amdgpu-named-reg-pin-std`](https://github.com/yuyzhang512/llvm-project/tree/amdgpu-named-reg-pin-std),
-tested at `583640bc5`): a pinned value has no storage of its own, and every
-read or write becomes `llvm.read_register` / `llvm.write_register` with the
-range as an `MDString` name.
-
-**Required LLVM.** Upstream LLVM has no VGPR/AGPR names for `llvm.read_register`, so
-pins need an LLVM built from this branch. Validated revision (also in
-`flydsl/compiler/named_reg.py:PIN_LLVM`, and `named_reg.py build` records `llc --version`
-in `report.json` and warns on another version):
-
-| | |
-|---|---|
-| Repository / branch | `https://github.com/yuyzhang512/llvm-project`, `amdgpu-named-reg-pin-std` |
-| Commit | `583640bc544035fcc87177fee0410e0d87693919` (2026-10-13) |
-| LLVM version | `24.0.0git` |
-| Upstream base | `llvm/llvm-project` main `3c6519006af45003813933136037c376a23a1338` (2026-08-24) |
-| Backend commits used | `8613a6d45f` pin a local variable to a named VGPR/AGPR; `2aec92e019` do not fold a splat through a copy to a physical register; `565060911b` pick the MFMA AGPR form per instruction. The branch's three clang commits are not needed. |
-| Build | Release + assertions, `LLVM_TARGETS_TO_BUILD=AMDGPU`, tools `opt`, `llc`, `ld.lld` |
-
-FlyDSL itself (the bundled `_mlir`) is unchanged; only the final `opt`/`llc`/`ld.lld` of a
-pinned kernel come from this LLVM.
+`flydsl.sched.pins` turns "place this value in `v[a:b]`" into schedule data. A pin
+is a **register-allocation hint at the value's definition**. The mechanism is
+ROCm/FlyDSL#1307 (`rocdl.sched.{vgpr,agpr,sgpr}`, the required LLVM patch
+`thirdparty/llvm-extensions/schedule-bank-and-gpr.patch` on the pinned LLVM). It replaced an
+earlier version built on `llvm.read_register` / `llvm.write_register` and a named-register
+LLVM branch (user decision, 2026-10-20).
 
 ```python
 loop = Section("k", body.ops, loop=("k", rng), carried=("acc",))
-loop.pins = {"acc": "v[128:131]"}             # loop-carried: reserved for the whole function
-b.op("vmem_load", "load_x", outs=("x",), out_dwords={"x": 4}, pins={"x": "v[64:67]"})  # one definition
+loop.pins = {"acc": "v[128:131]"}                 # strict hint
+b.op("vmem_load", "load_x", outs=("x",), out_dwords={"x": 4}, pins={"x": "v[64:67] soft"})
 ```
 
-* `Section.pins` (loop-carried values): written before the loop and at the end of
-  every iteration, read at the top of every iteration and after the loop. The
-  read at the top is a live-in read, so the branch reserves the range for the
-  whole function.
-* `Op.pins` (one definition): written where the op defines it; every later read
-  of the value, until it is redefined, reads the range.
-* `kernels/attention/sched/mha_gfx950_pinned.py` builds a pinned variant of the
-  MHA schedule (presets `o` = `v_o` in `v[192:255]`, `ml` = `m_row`/`l_row`).
+* Spec: `"v42"`, `"v[64:79]"`, `"a[0:3]"`, `"s[4:5]"`. Strict by default; a trailing
+  `" soft"` makes it advisory.
+* `Op.pins`: the op's output is hinted where the op defines it.
+* `Section.pins` (loop-carried values) are hinted at four places: the initial value, the
+  iteration argument at the top of the body (the loop-header phi), the new value at the end
+  of the body, and the loop result. `emit_program` applies these through its codecs.
+* `kernels/attention/sched/mha_gfx950_pinned.py` builds pinned variants of the MHA
+  schedule. Presets: `o` (`v_o` in `v[192:255]`), `ml` (`m_row`/`l_row` in `v190`/`v191`),
+  and `*_soft`.
 
-**Verifier** (`pins.check`, run by `verify`): `PIN.SYNTAX`, `PIN.UNKNOWN_VALUE`,
-`PIN.WIDTH` (range width must equal the value's dwords from `out_dwords`; the branch
-rejects other names), `PIN.WIDTH_UNKNOWN`, `PIN.SPLIT` (a width with no register class,
-1/2/3/4/8/16 dwords for `v`, 1/2/4/8/16 for `a`: every leaf of the value takes
-consecutive sub-ranges), `PIN.OUT_OF_FILE` (`arch_vgpr_max_per_wave` /
-`acc_vgpr_max_per_wave`), `PIN.NO_AGPR`, `PIN.ALIGN` (`vgpr_tuple_alignment`),
-`PIN.ABI` (`v0` holds the work-item id at entry), `PIN.OVERLAP` (two pins sharing
-registers while both are live; a carried pin is live everywhere), `PIN.CARRIED_OP_PIN`
-(pin a carried value on its loop), `PIN.MULTI`, `PIN.RESERVED` (info: the range is
-reserved for the function), `PIN.BUDGET` (pins above the `waves_per_eu` budget),
-`PIN.ASYNC_SPILL` and `PIN.SCHED` (see below).
+**How the hint works.** `rocdl.sched.vgpr %v, regnum [soft]` is an identity op. It lowers
+to `llvm.amdgcn.sched.vgpr` and a pseudo. The pre-RA `AMDGPUSchedBank` pass replaces the
+pseudo with a COPY and puts the hint on both sides of it. The hint is propagated through
+COPY / REG_SEQUENCE / INSERT_SUBREG / SUBREG_TO_REG.
+* A strict hint is a hard hint: `getRegAllocationHints` returns only that register.
+* A soft hint moves the register to the front of the allocation order.
+* Widths are 32/64/128/256/512 bits. Wider values are split into leaves on consecutive
+  sub-ranges. The backend silently drops a hint of any other width, so the verifier
+  rejects those widths.
+* Nothing is reserved: other values may use the range while the pinned value is dead.
 
-**Lowering** (opt-in, no FlyDSL rebuild). `emit_program` wraps carried pins into its
-codecs (`pins.pin_codecs`), `lower.emit` reads/writes op pins (`pin_inputs` /
-`pin_outputs`). Each read or write is an inline-asm marker,
-`";flydsl.pin.write v[128:131]"` with a tied `"=v,0"` operand, which the stock
-toolchain compiles as a no-op. `tools/named_reg/named_reg.py` does the rest:
+**Verifier** (`pins.check`, run by `verify`):
+* `PIN.SYNTAX`, `PIN.UNKNOWN_VALUE`.
+* `PIN.WIDTH`: the range width must equal `out_dwords`. `PIN.WIDTH_UNKNOWN`.
+* `PIN.SPLIT`: no single hint width fits, so the value is split into leaves.
+* `PIN.OUT_OF_FILE`: checked against `arch_vgpr_max_per_wave`, `acc_vgpr_max_per_wave`
+  and `sgpr_addressable_per_wave`.
+* `PIN.NO_AGPR`.
+* `PIN.ALIGN`: a tuple that does not start on an even register has no candidate. Error
+  for strict, warning for soft.
+* `PIN.ABI`: the range includes `v0`.
+* `PIN.CARRIED` (info), `PIN.MULTI`.
+* `PIN.CONFLICT`: an op pin disagrees with its loop's pin.
+* `PIN.OVERLAP`: two live pins share registers. Error if both are strict.
+* `PIN.BUDGET`, `PIN.ASYNC_SPILL` (strict pins only), `PIN.SCHED`.
 
-```bash
-python3 tools/named_reg/named_reg.py prepare WS -- python3 bench.py   # dump + cache (inject_asm prepare)
-python3 tools/named_reg/named_reg.py build WS pin --llvm $PIN_LLVM/bin \
-    --llvm-opt enable-post-misched=false --llvm-opt lsr-drop-solution=true
-python3 tools/named_reg/named_reg.py run WS pin [-- other command]    # RUN_ONLY on the patched cache copy
-```
+**Checking placement.** `pins.isa_pin_report(asm, ranges)` reports, per requested range:
+writers, readers, MFMAs accumulating in place, and register copies into or out of it
+(`PIN.INDIRECT`). `pins.mfma_accumulators(asm)` shows where accumulators actually live.
+`pins.pending_lds_uses(asm)` flags copies or spills that touch an inline-asm LDS read before
+its wait. `tools/named_reg/isa_report.py <final_isa.s> <ranges>` prints all three for a
+`FLYDSL_DUMP_IR=1` dump.
 
-`build` rewrites the markers of the dumped `NN_llvm_ir.ll`
-(`flydsl/compiler/named_reg.py:rewrite_markers`; `strip` removes them instead, `plain`
-keeps them), runs `opt -O2` and `llc -O2` for `amdgcn-amd-amdhsa`/`gfx950` with the
-kernel's `llvm_options` (not in the dump: pass them with `--llvm-opt`), links with
-`ld.lld -shared`, swaps the code object into a copy of the JIT cache entry
-(`inject_asm.replace_binary(code_object=...)`) and writes `report.json`: resources,
-the instruction count against FlyDSL's own ISA, `isa_pin_report` per range (writers,
-readers, in-place users, copies in/out = `PIN.INDIRECT`, by block) and
-`pending_lds_uses`. Kernels that call device libraries are refused. Any edit under
-`flydsl/compiler/` changes the JIT cache key, so prepare again after one.
+### Results (MI355X GPU 3, 2026-10-20)
 
-### Results (MI355X GPU 3, 2026-10-19)
+Setup:
+* LLVM `1df311a6` + the required patches (incl. `schedule-bank-and-gpr.patch`), built with
+  `scripts/build_llvm.sh` (`amd-minimal`) and `scripts/build.sh`. ROCm 7.2.4 container.
+* Every variant is correct (fp32 reference / SDPA).
+* Timing: bf16; median of 30 launches per process; 5 interleaved rounds. The table gives
+  the median of the round medians and the round range.
+* With no pins, the patch changes nothing: the unpinned MHA ISA (D=128 and D=64) is
+  identical to that of the same LLVM hash built without `schedule-bank-and-gpr.patch`.
 
-Pin LLVM: `583640bc544035fcc87177fee0410e0d87693919`, Release + assertions, AMDGPU only.
-FlyDSL 0.4.0 wheel `_mlir`, ROCm 7.2.4 container. Timing: CUDA-event median of 30 launches
-per process, processes interleaved over 5 rounds (3 for the low-register rows); the table gives
-the median of the round medians with the per-round range.
-
-* **Reproduction.** On unmodified IR the branch's `opt`+`llc` reproduces FlyDSL's MHA D=128
-  ISA instruction for instruction (2888/2888, same 244 VGPR / 96 SGPR). At D=64 it differs in
-  134 lines (mostly SGPR numbering in the prologue; 2248 vs 2244 instructions) with the same
-  time. The demo kernel reproduces exactly.
-* **Placement.** A 4-dword accumulator (`v_mfma_f32_16x16x32_bf16`) pinned to `v[8:11]`,
-  `v[128:131]` or `a[0:3]` is accumulated in place: the MFMA reads and writes the range,
-  the result is stored from it, no copies. A 16-dword accumulator (`32x32x16`) is not:
-  the branch copies it out of and back into the range around every MFMA (24 copies in,
-  40 out in the demo; `PIN.INDIRECT`). MHA `m_row`/`l_row` pinned to `v190`/`v191`: 3
-  copies in total. MHA D=64 `v_o` (32 dwords): 8 copies in / 16 out per 16-dword leaf.
-* **Branch limitation.** A 16-dword AGPR pin (`a[16:31]` with `v16i32`) aborts `llc` on
-  gfx942/gfx950 (`indirectCopyToAGPR`: "Expected GFX908 subtarget", from the SGPR-pair
-  copy of the zero initializer); 4 dwords work.
-* **Async loads.** MHA D=128 with `v_o` pinned (64 dwords) needs all 256 VGPRs and spills;
-  the spill code then stores destinations of inline-asm `ds_read_b64_tr_b16` before their
-  `lgkmcnt` wait (70 such instructions), and the result is wrong. The same happens without
-  pins when the stock compiler spills this kernel (`waves_per_eu=3`: 61 such instructions,
-  NaN), so it is the kernel's untracked async loads, not the pin. `PIN.ASYNC_SPILL` warns,
-  `pending_lds_uses` finds it on the ISA.
-
-| kernel (bf16) | variant | us | vs. stripped markers |
+| kernel | pin | where the value lives (ISA) | us |
 |---|---|---|---|
-| MHA D=128 B4 S8192 H64 | FlyDSL / pin-llc plain | 7431.8 [7429.9-7435.5] / 7437.2 [7421.4-7441.8] | |
-| | `ml` stripped / pinned | 7436.4 [7434.2-7440.4] / 7454.8 [7453.1-7463.5] | +0.25% |
-| MHA D=64 B4 S8192 H32 | FlyDSL / pin-llc plain | 2373.2 [2372.5-2376.4] / 2373.5 [2372.9-2374.5] | |
-| | `v_o` stripped / `v[224:255]` / `v[32:63]` | 2373.5 [2369.1-2375.0] / 2525.6 [2519.9-2528.9] / 2523.4 [2521.9-2525.7] | +6.4% |
-| demo 16x16x32, 4096 blocks x 512 steps | stripped / `v[128:131]` / `v[8:11]` / `a[0:3]` | 762.6 / 855.3 / 760.9 / 761.6 | +12% at v128, 0 otherwise |
-| demo 32x32x16, same | stripped / `v[128:143]` | 776.2 [775.4-778.5] / 930.6 [929.8-933.5] | +20% |
+| demo 16x16x32, 4096 blocks x 512 steps | none | acc in `v[0:3]` | 753.7 [749.6-761.8] |
+| | `v[128:131]` strict / soft | acc in `v[128:131]`, in place, 0 copies; 132 VGPRs | 826.0 / 829.1 |
+| | `v[8:11]` | acc in `v[8:11]`, in place, 0 copies | 754.4 |
+| | `a[0:3]` strict | **not honoured**: acc stays in VGPRs | 753.0 |
+| | `a[0:3]` soft | 4 of 5 MFMAs in `a[0:3]`, 4+4 copies | 751.7 |
+| demo 32x32x16, same | none | acc in `v[2:17]` | 767.0 [765.8-775.1] |
+| | `v[128:143]` strict / soft | acc in `v[128:143]`, in place, 0 copies; 144 VGPRs | 875.1 / 879.6 |
+| | `a[0:15]` strict | acc in `a[0:15]` (AGPR-form MFMA), in place | 768.6 |
+| MHA D=128 B4 S8192 H64 | none | | 7425.6 [7422.7-7440.7] |
+| | `ml` (`v190`/`v191`) | ISA differs from unpinned by 5 lines, no sign of the hint | 7430.9 |
+| | `o` (`v[192:255]`) | **not honoured**: accumulators stay in `v[0:95]` | 7428.5 |
+| MHA D=64 B4 S8192 H32 | none | | 2371.6 [2369.5-2375.5] |
+| | `v_o` → `v[224:255]` | **not honoured**: nothing uses `v224+`; same ISA as `v[32:63]` | 2373.0 |
 
-Round-to-round spread is about 0.1% for the MHA rows and 0.5% for the demo. The demo
-`v[128:131]` cost is occupancy (132 VGPRs: 3 waves instead of 8); the D=64 MHA cost is
-occupancy (164 -> 196/256 VGPRs, 3 -> 2 waves) plus the copies. Pin low registers, and pin
-32x32 accumulators only once the branch accumulates them in place.
+* **Where hints work.** Hints are honoured when the hinted virtual register survives
+  register coalescing. That happens in the one-block demo loop. There, strict pins even
+  keep a 32x32 accumulator in place, which the earlier named-register path could not
+  (it needed 24+40 copies). The demo's cost at `v128` is occupancy only: 132/144 VGPRs. At
+  low registers or in AGPRs the cost is zero.
+* **Where they are lost.** In the MHA, the loop-carried values become phis. The coalescer
+  merges the hinted virtual registers into the phi-elimination registers, and the target
+  hint does not move with them. `llc -debug-only=amdgpu-sched-bank,regalloc` shows this:
+  the hint `reg 240 strict` is set on `%2733`, but greedy then allocates the merged `%5308`
+  with only a copy hint (`$vgpr0..15`). So **with the PR patch alone, a pin on a
+  loop-carried value in a real kernel does not get its register, strict or not**. The hints
+  still change codegen slightly; the time is unchanged within noise.
+* **Shared initial values.** Two leaves initialized by the same constant are CSE'd into one
+  value before the loop. Their two hints then land on one virtual register, and the second
+  hint is dropped.
+* **Comparison with the named-register path (2026-10-19).**
+  * What it did: it forced placement through reserved registers. 4-dword accumulators
+    accumulated in place. 16-dword accumulators needed copies around every MFMA (+20% in
+    the demo). MHA `ml` cost +0.25%. D=64 `v_o` cost +6.4%. That cost was put down to
+    occupancy and copies; the experiment below reaches 256 VGPRs at no cost, which leaves
+    the copies around the loop as the likely cause.
+  * What hints do instead: no copies inside the MFMA chain where a hint holds. Copies
+    appear only where the allocator moves a value into the range: `a[0:3]` soft, and the
+    experiment below. But a hint holds only where coalescing keeps the hinted register.
+* **Experiment, not part of the PR patch.** A 40-line `SIRegisterInfo::updateRegAllocHint`
+  override carries the sched hint onto the register the coalescer keeps. It was built
+  remotely only, on top of the required patches. Results (5 rounds):
+  * D=64 `v_o` → `v[224:255]`: the PV MFMAs accumulate in place in `v[224:255]`, with copies
+    into the range only outside the MFMA chain. VGPRs 164 → 256; time 2371.0 vs 2370.8 us
+    unpinned.
+  * D=128 `o`: the PV MFMAs accumulate in `v[192:255]`. 256 VGPRs, 6 VGPRs spilled (28 bytes
+    of scratch, no LDS-read hazards). 7438.1 vs 7431.4 us (+0.09%).
+  * D=128 `ml`: `v190`/`v191` now hold the row max/sum (2 copies). 7426.4 us.
+  * Strict and soft give the same ISA in every case.
+  * With the hint carried across coalescing, loop-carried pins do get their registers, at no
+    measurable cost in this kernel. Whether to add this to the patch is open.
 
 ## Issue programs
 

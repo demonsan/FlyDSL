@@ -6,11 +6,11 @@
 Built from the base schedule (``mha_gfx950.build_mha_schedule``): the KV loop
 gets ``Section.pins`` and the schedule a new name, nothing else changes.  The
 kernel (``flash_attn_sched_gfx950.build_flash_attn_sched_gfx950_module(...,
-schedule=...)``) emits pin markers through ``emit_program``; with the stock
-toolchain they are no-ops, ``tools/named_reg`` compiles them into named-register
-reads/writes with the pin branch's ``llc``.
+schedule=...)``) lowers the pins through ``emit_program`` to register-allocation
+hints (``rocdl.sched.vgpr``, see ``flydsl.sched.pins``).
 
-Presets (D=128, waves_per_eu=2, 256 arch VGPRs per wave):
+Presets (D=128, waves_per_eu=2, 256 arch VGPRs per wave); ``*_soft`` are the same
+ranges as advisory hints:
 
 * ``"o"``: the O accumulator (``v_o``, 4 x f32x16 = 64 dwords) in ``v[192:255]``;
 * ``"ml"``: the softmax row max / row sum (``m_row``, ``l_row``, 1 dword each) in
@@ -26,6 +26,7 @@ PRESETS: Dict[str, Dict[str, str]] = {
     "o": {"v_o": "v[192:255]"},
     "ml": {"m_row": "v190", "l_row": "v191"},
 }
+PRESETS.update({f"{k}_soft": {v: f"{r} soft" for v, r in t.items()} for k, t in list(PRESETS.items())})
 
 
 def build_pinned_mha_schedule(

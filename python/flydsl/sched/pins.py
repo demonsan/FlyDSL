@@ -1,67 +1,62 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Register pins: "this value lives in v[a:b]" as Schedule IR data.
+"""Register pins: "place this value in v[a:b]" as Schedule IR data.
 
-A pin names a physical register range for a value:
+A pin is a register-allocation hint at a value's *definition*:
 
-* ``Op.pins = {out: "v[64:79]"}`` -- this definition is written to the range and
-  every later read of the value (until it is redefined) reads the range;
-* ``Section.pins = {carried: "v[192:255]"}`` -- a loop-carried value lives in the
-  range across the whole loop: it is written before the loop and at the end of
-  every iteration, read at the top of every iteration and after the loop.
+* ``Op.pins = {out: "v[64:79]"}`` -- the value this op defines is hinted to the range;
+* ``Section.pins = {carried: "v[192:255]"}`` -- a loop-carried value is hinted to the
+  range wherever the loop defines or receives it: the initial value before the loop,
+  the iteration argument at the top of the body (the loop-header phi), the new value
+  at the end of the body and the loop result.
 
-Semantics follow the AMDGPU named-register branch
-(``yuyzhang512/llvm-project`` ``amdgpu-named-reg-pin-std``): a pinned value has
-no storage of its own; every read and write becomes ``llvm.read_register`` /
-``llvm.write_register`` with the range as an ``MDString`` name.  The branch
+A spec is ``"v42"``, ``"v[64:79]"``, ``"a[0:3]"`` or ``"s10"``/``"s[4:5]"``, strict by
+default; append ``" soft"`` (``"v[64:79] soft"``) for an advisory hint.
 
-* accepts only names whose width equals the value's width in dwords, and only
-  widths of a register class (``WIDTHS``);
-* rejects ranges beyond the addressable VGPR file of the subtarget;
-* reserves a range for the whole function when it is read in a block before any
-  write in that block (a live-in read: always the case for loop-carried pins);
-  other ranges are protected by liveness only;
-* selects the AGPR form of an MFMA when its operands are pinned to ``a[...]``.
+Mechanism (ROCm/FlyDSL#1307, the required LLVM patch ``schedule-bank-and-gpr.patch``):
+each hint is ``rocdl.sched.{vgpr,agpr,sgpr} %v, regnum [soft]``, an identity op that
+lowers to ``llvm.amdgcn.sched.*`` and a pseudo; the pre-RA ``AMDGPUSchedBank`` pass
+turns it into a COPY and attaches an allocation hint to both sides, propagated through
+COPY / REG_SEQUENCE / INSERT_SUBREG / SUBREG_TO_REG.  A *strict* hint is a hard hint
+(``getRegAllocationHints`` returns true: the allocator considers only that register for
+the hinted virtual registers); a *soft* one only moves it to the front.  Widths are
+32/64/128/256/512 bits (``WIDTHS``); a wider value is split into leaves that take
+consecutive sub-ranges, and the backend silently drops a hint of any other width, so the
+verifier rejects those.
 
-The guarantee is placement at the read/write points.  Whether the producer
-(an MFMA, a ``ds_read``) writes the range directly or through a ``v_mov`` copy
-depends on register coalescing; ``flydsl.compiler.named_reg.isa_pin_report``
-counts such copies on the final ISA (``PIN.INDIRECT``).
+Nothing is reserved: a pinned value occupies the range while it is live, other values
+may use it otherwise.  What actually happened is visible only on the ISA:
+:func:`isa_pin_report` lists who writes and reads each range, MFMAs that accumulate in
+place, and the register copies into or out of it (``PIN.INDIRECT``).
 
-Lowering is opt-in and needs no compiler rebuild: :func:`pin_value` emits an
-inline-asm *marker* (an asm comment with a tied ``"=v,0"`` operand) that the
-stock toolchain compiles as a no-op; ``flydsl.compiler.named_reg`` rewrites the
-markers in the dumped LLVM IR into the intrinsics, and ``tools/named_reg``
-compiles that with the branch's ``llc`` and runs it through the JIT cache.
+History: an earlier version pinned through ``llvm.read_register`` /
+``llvm.write_register`` with a named-register LLVM branch; it was replaced by this
+mechanism (user decision, 2026-10-20).
 
 This module is pure Python (MLIR is imported lazily by the lowering helpers).
 """
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .ir import Op, Schedule, Section
 from .target import TargetDesc, load_target
 
-# Validated LLVM; flydsl/compiler/named_reg.py PIN_LLVM has the full record (base, backend commits, build).
-BRANCH = "yuyzhang512/llvm-project amdgpu-named-reg-pin-std @583640bc544035fcc87177fee0410e0d87693919 (LLVM 24.0.0git)"
-# Widths (dwords) SITargetLowering::getRegisterByName maps to a register on the branch:
-# 32-bit, or the VReg_64/96/128/256/512 resp. AReg_64/128/256/512 tuple classes.
-WIDTHS = {"v": (1, 2, 3, 4, 8, 16), "a": (1, 2, 4, 8, 16)}
-_FILE_FACT = {"v": "arch_vgpr_max_per_wave", "a": "acc_vgpr_max_per_wave"}
+# Widths (dwords) the AMDGPU ISel lowers llvm.amdgcn.sched.{vgpr,agpr,sgpr} to a pseudo for
+# (B32/B64/B128/B256/B512 in schedule-bank-and-gpr.patch); any other width is dropped silently.
+WIDTHS = {"v": (1, 2, 4, 8, 16), "a": (1, 2, 4, 8, 16), "s": (1, 2, 4, 8, 16)}
+_FILE_FACT = {"v": "arch_vgpr_max_per_wave", "a": "acc_vgpr_max_per_wave", "s": "sgpr_addressable_per_wave"}
+_OPS = {"v": "sched_vgpr", "a": "sched_agpr", "s": "sched_sgpr"}
 
-MARKER = ";flydsl.pin"  # inline-asm text: "<MARKER>.<mode> <reg>"
-MODES = ("read", "write")
-LIVE_KEY = "__pins__"  # emit env key: value name -> range of its current pinned definition
-
-_REG_RE = re.compile(r"^([va])(?:(\d+)|\[(\d+):(\d+)\])$")
+_REG_RE = re.compile(r"^([vas])(?:(\d+)|\[(\d+):(\d+)\])$")
 
 
 @dataclass(frozen=True)
 class RegRange:
-    """``v[lo:hi]`` / ``a[lo:hi]`` (inclusive), or one register ``v5``."""
+    """``v[lo:hi]`` / ``a[lo:hi]`` / ``s[lo:hi]`` (inclusive), or one register ``v5``."""
 
     file: str
     lo: int
@@ -71,7 +66,7 @@ class RegRange:
     def parse(cls, text: str) -> "RegRange":
         m = _REG_RE.match(str(text).strip())
         if m is None:
-            raise ValueError(f"bad register range {text!r}: expected 'v12', 'v[64:79]' or 'a[0:15]'")
+            raise ValueError(f"bad register range {text!r}: expected 'v12', 'v[64:79]', 'a[0:15]' or 's[4:5]'")
         f, one, lo, hi = m.groups()
         lo, hi = (int(one), int(one)) if one is not None else (int(lo), int(hi))
         if hi < lo:
@@ -94,9 +89,26 @@ class RegRange:
         return f"{self.file}{self.lo}" if self.lo == self.hi else f"{self.file}[{self.lo}:{self.hi}]"
 
 
-def marker_text(mode: str, reg: RegRange) -> str:
-    assert mode in MODES
-    return f"{MARKER}.{mode} {reg}"
+@dataclass(frozen=True)
+class PinSpec:
+    """A register range and whether the hint is strict (default) or soft."""
+
+    reg: RegRange
+    strict: bool = True
+
+    @classmethod
+    def parse(cls, text) -> "PinSpec":
+        if isinstance(text, PinSpec):
+            return text
+        parts = str(text).split()
+        if len(parts) == 2 and parts[1] in ("soft", "strict"):
+            return cls(RegRange.parse(parts[0]), parts[1] == "strict")
+        if len(parts) != 1:
+            raise ValueError(f"bad pin {text!r}: expected '<range>' or '<range> soft'")
+        return cls(RegRange.parse(parts[0]))
+
+    def __str__(self):
+        return str(self.reg) if self.strict else f"{self.reg} soft"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -107,7 +119,7 @@ def marker_text(mode: str, reg: RegRange) -> str:
 @dataclass(eq=False)
 class PinDecl:
     value: str
-    reg: str  # as written
+    spec: str  # as written
     scope: str  # "op" | "carried"
     sec: Section = field(repr=False)
     op_index: Optional[int] = None  # op pins: index in the section
@@ -121,7 +133,7 @@ class PinDecl:
     def where(self) -> str:
         g = f"g{self.group}:" if self.group is not None else ""
         at = f"/ops[{self.op_index}]" if self.op_index is not None else ""
-        return f"{g}{self.section}{at} {self.value}->{self.reg}"
+        return f"{g}{self.section}{at} {self.value}->{self.spec}"
 
 
 def _programs(sched: Schedule) -> List[Tuple[Optional[int], List[Section]]]:
@@ -145,17 +157,17 @@ def declarations(sched: Schedule) -> List[PinDecl]:
     out, seen = [], set()
     for g, secs in _programs(sched):
         for sec in secs:
-            for value, reg in getattr(sec, "pins", {}).items():
+            for value, spec in getattr(sec, "pins", {}).items():
                 key = (id(sec), None, value)
                 if key not in seen:
                     seen.add(key)
-                    out.append(PinDecl(value, reg, "carried", sec, None, g))
+                    out.append(PinDecl(value, spec, "carried", sec, None, g))
             for i, op in enumerate(sec.ops):
-                for value, reg in getattr(op, "pins", {}).items():
+                for value, spec in getattr(op, "pins", {}).items():
                     key = (id(sec), i, value)
                     if key not in seen:
                         seen.add(key)
-                        out.append(PinDecl(value, reg, "op", sec, i, g))
+                        out.append(PinDecl(value, spec, "op", sec, i, g))
     return out
 
 
@@ -172,48 +184,61 @@ def has_pins(sched: Schedule) -> bool:
 # ---------------------------------------------------------------------------------------------
 
 
-def _intervals(secs: Sequence[Section]):
-    """Linear positions of ``secs`` and the (start, end) span of every loop section."""
+def _positions(secs: Sequence[Section]):
+    """Linear position of every op and the (first, last) span of every section."""
     pos, spans, p = {}, {}, 0
     for si, sec in enumerate(secs):
         start = p
-        for oi, _ in enumerate(sec.ops):
+        for oi in range(len(sec.ops)):
             pos[(si, oi)] = p
             p += 1
         spans[si] = (start, max(p - 1, start))
-    return pos, spans, p
+    return pos, spans
 
 
-def _op_pin_lifetime(secs, si, oi, value):
-    """[first, last] linear position where an op-pinned definition is live, and whether a read is live-in."""
-    pos, spans, total = _intervals(secs)
-    start = pos[(si, oi)]
+def _live_until(secs, si, oi, value, pos, spans):
+    """Last position a definition of ``value`` at (si, oi) is read before it is redefined.
+
+    A definition outside a loop that the loop reads is live around the whole loop."""
+    start = pos[(si, oi)] if oi is not None else spans[si][0]
     end = start
-    live_in = False
-    loops_crossed = set()
-    # forward walk until the value is redefined
-    order = [(sj, oj) for sj, sec in enumerate(secs) for oj in range(len(sec.ops))]
-    for sj, oj in order:
-        if pos[(sj, oj)] <= start:
-            continue
-        op = secs[sj].ops[oj]
-        if value in op.ins:
-            end = pos[(sj, oj)]
-            if sj != si:
-                live_in = True
-                if secs[sj].loop is not None:
-                    loops_crossed.add(sj)
-        if value in op.outs:
+    for sj, sec in enumerate(secs):
+        for oj, op in enumerate(sec.ops):
+            if pos[(sj, oj)] <= start:
+                continue
+            if value in op.ins:
+                end = max(end, pos[(sj, oj)])
+                if sj != si and sec.loop is not None:
+                    end = max(end, spans[sj][1])
+            if value in op.outs:
+                return end
+    return end
+
+
+def _lifetime(secs, si, oi, value, pos, spans):
+    """[first, last] position where a pinned definition (op pin) or carried value (oi None) is live."""
+    if oi is not None:
+        return pos[(si, oi)], _live_until(secs, si, oi, value, pos, spans)
+    # carried: from its last definition before the loop to its last use after it
+    start = spans[si][0]
+    for sj in range(si - 1, -1, -1):
+        hit = [oj for oj, op in enumerate(secs[sj].ops) if value in op.outs]
+        if hit:
+            start = pos[(sj, hit[-1])]
             break
-    # a definition outside a loop that is read inside it is live around the whole loop
-    for sj in loops_crossed:
-        end = max(end, spans[sj][1])
-    return start, end, live_in
+    end = spans[si][1]
+    for sj in range(si + 1, len(secs)):
+        for oj, op in enumerate(secs[sj].ops):
+            if value in op.ins:
+                end = pos[(sj, oj)]
+            if value in op.outs:
+                return start, end
+    return start, end
 
 
 def check(sched: Schedule, target: Optional[TargetDesc] = None, report=None):
     """Add ``PIN.*`` findings for ``sched`` to ``report`` (a ``verify.Report``); returns the report."""
-    from .verify import Finding, Report  # lazy: verify may call this module
+    from .verify import Finding, Report  # lazy: verify calls this module
 
     target = target or load_target(sched.target)
     if report is None:
@@ -232,17 +257,16 @@ def check(sched: Schedule, target: Optional[TargetDesc] = None, report=None):
                 for name, d in op.out_dwords.items():
                     dwords_of.setdefault(name, set()).add(d)
 
-    parsed: Dict[PinDecl, RegRange] = {}
+    parsed: Dict[PinDecl, PinSpec] = {}
     for d in decls:
         try:
-            parsed[d] = RegRange.parse(d.reg)
+            parsed[d] = PinSpec.parse(d.spec)
         except ValueError as exc:
             find("PIN.SYNTAX", "error", str(exc), d.where)
 
-    carried_regs: Dict[str, set] = {}
-    for d, reg in parsed.items():
-        sec = d.sec
-        # the value exists where the pin says
+    carried_specs: Dict[str, set] = {}
+    for d, spec in parsed.items():
+        reg, sec = spec.reg, d.sec
         if d.scope == "carried":
             if sec.loop is None:
                 find("PIN.UNKNOWN_VALUE", "error", f"section {sec.name} is not a loop; it carries nothing", d.where)
@@ -253,7 +277,7 @@ def check(sched: Schedule, target: Optional[TargetDesc] = None, report=None):
                     f"{d.value!r} is not carried by loop {sec.name} (carried: {list(sec.carried)})",
                     d.where,
                 )
-            carried_regs.setdefault(d.value, set()).add(str(reg))
+            carried_specs.setdefault(d.value, set()).add(str(reg))
             known = dwords_of.get(d.value, set())
         else:
             op = sec.ops[d.op_index]
@@ -271,19 +295,14 @@ def check(sched: Schedule, target: Optional[TargetDesc] = None, report=None):
             )
         for w in sorted(known):
             if w != reg.dwords:
-                find(
-                    "PIN.WIDTH",
-                    "error",
-                    f"{reg} is {reg.dwords} dwords but {d.value!r} is {w}; the branch rejects a name whose width "
-                    "differs from the value's",
-                    d.where,
-                )
+                find("PIN.WIDTH", "error", f"{reg} is {reg.dwords} dwords but {d.value!r} is {w}", d.where)
         if reg.dwords not in WIDTHS[reg.file]:
             find(
                 "PIN.SPLIT",
                 "info",
-                f"{reg} ({reg.dwords} dwords) is no single {reg.file}-register class (widths {WIDTHS[reg.file]}); "
-                "the lowering pins every leaf of the value to consecutive sub-ranges and fails if a leaf is not one",
+                f"{reg} ({reg.dwords} dwords) has no single hint width ({WIDTHS[reg.file]} dwords); the lowering "
+                "hints every leaf of the value to consecutive sub-ranges and fails if a leaf has another width "
+                "(the backend would drop that hint silently)",
                 d.where,
             )
 
@@ -297,22 +316,26 @@ def check(sched: Schedule, target: Optional[TargetDesc] = None, report=None):
                 d.where,
             )
         size = target.get(_FILE_FACT[reg.file])
-        if size is None and reg.file == "v":
-            find("TARGET.UNKNOWN", "warn", f"{target.key}: {_FILE_FACT['v']} unknown; cannot range-check {reg}")
-        elif size is not None and reg.hi >= size:
+        if size is None:
+            if reg.file != "a":
+                find(
+                    "TARGET.UNKNOWN", "warn", f"{target.key}: {_FILE_FACT[reg.file]} unknown; cannot range-check {reg}"
+                )
+        elif reg.hi >= size:
             find(
                 "PIN.OUT_OF_FILE",
                 "error",
                 f"{reg} is beyond the {size} {reg.file}-registers a wave can address on {target.key}",
                 d.where,
             )
-        align = target.get("vgpr_tuple_alignment")
+        align = target.get("vgpr_tuple_alignment") if reg.file in "va" else 2
         if reg.dwords > 1 and align and reg.lo % align:
             find(
                 "PIN.ALIGN",
-                "warn",
-                f"{reg} is not {align}-aligned; {target.key} needs aligned register tuples, so multi-dword "
-                "accesses go through copies",
+                "error" if spec.strict else "warn",
+                f"{reg} is not {align}-aligned: no {reg.dwords}-dword register of {target.key} starts at "
+                f"{reg.file}{reg.lo}, so the hint has no candidate"
+                + (" (a strict hint then leaves the allocator nothing to choose)" if spec.strict else ""),
                 d.where,
             )
         if reg.file == "v" and reg.lo == 0:
@@ -325,61 +348,53 @@ def check(sched: Schedule, target: Optional[TargetDesc] = None, report=None):
             )
         if d.scope == "carried":
             find(
-                "PIN.RESERVED",
+                "PIN.CARRIED",
                 "info",
-                f"{reg} is read at the top of every iteration before it is written there, so the branch reserves it "
-                f"for the whole function ({reg.dwords} registers fewer for everything else)",
+                f"{reg} is hinted at the initial value, the loop-header phi (top of the body), the new value at the "
+                "end of the body and the loop result; whether the phi gets it is decided by the allocator",
                 d.where,
             )
 
-    for value, regs in carried_regs.items():
+    for value, regs in carried_specs.items():
         if len(regs) > 1:
             find("PIN.MULTI", "error", f"carried value {value!r} pinned to different ranges {sorted(regs)}", value)
 
-    # lifetimes and overlap, per program
+    # lifetimes, conflicts and overlap, per program
     by_place = {(id(d.sec), d.op_index, d.value): d for d in parsed}
     for _, secs in _programs(sched):
-        live: List[Tuple[int, int, PinDecl, RegRange]] = []
-        carried_here = {n for s in secs if s.loop is not None for n in s.carried}
+        pos, spans = _positions(secs)
+        carried_pin = {v: parsed[d] for d in parsed if d.scope == "carried" for v in [d.value]}
+        live: List[Tuple[int, int, PinDecl, PinSpec]] = []
         for si, sec in enumerate(secs):
             for value in getattr(sec, "pins", {}):
                 d = by_place.get((id(sec), None, value))
                 if d is not None:
-                    live.append((-1, 1 << 30, d, parsed[d]))  # reserved: the whole function
+                    live.append((*_lifetime(secs, si, None, value, pos, spans), d, parsed[d]))
             for oi, op in enumerate(sec.ops):
                 for value in getattr(op, "pins", {}):
                     d = by_place.get((id(sec), oi, value))
                     if d is None:
                         continue
-                    if value in carried_here:
+                    other = carried_pin.get(value)
+                    if other is not None and other.reg != parsed[d].reg:
                         find(
-                            "PIN.CARRIED_OP_PIN",
+                            "PIN.CONFLICT",
                             "error",
-                            f"{value!r} is loop-carried; pin it on the loop (Section.pins) so the iter_arg and every "
-                            "iteration share the range",
+                            f"{value!r} is pinned to {parsed[d].reg} here but its loop pins it to {other.reg}",
                             d.where,
                         )
-                        continue
-                    s, e, live_in = _op_pin_lifetime(secs, si, oi, value)
-                    if live_in:
-                        find(
-                            "PIN.RESERVED",
-                            "info",
-                            f"{parsed[d]} is read in another section than it is written; that read is live-in, so "
-                            "the branch reserves the range for the whole function",
-                            d.where,
-                        )
-                        s, e = -1, 1 << 30
-                    live.append((s, e, d, parsed[d]))
-        for i, (s1, e1, d1, r1) in enumerate(live):
-            for s2, e2, d2, r2 in live[i + 1 :]:
-                if d1.value == d2.value and r1 == r2:
+                    live.append((*_lifetime(secs, si, oi, value, pos, spans), d, parsed[d]))
+        for i, (s1, e1, d1, p1) in enumerate(live):
+            for s2, e2, d2, p2 in live[i + 1 :]:
+                if d1.value == d2.value and p1.reg == p2.reg:
                     continue
-                if r1.overlaps(r2) and s1 <= e2 and s2 <= e1:
+                if p1.reg.overlaps(p2.reg) and s1 <= e2 and s2 <= e1:
+                    both = p1.strict and p2.strict
                     find(
                         "PIN.OVERLAP",
-                        "error",
-                        f"{d1.value}->{r1} and {d2.value}->{r2} share registers while both are live",
+                        "error" if both else "warn",
+                        f"{d1.value}->{p1.reg} and {d2.value}->{p2.reg} share registers while both are live"
+                        + ("; two strict hints cannot both hold" if both else "; at most one hint can hold"),
                         f"{d1.where} / {d2.where}",
                     )
 
@@ -388,7 +403,7 @@ def check(sched: Schedule, target: Optional[TargetDesc] = None, report=None):
     file_lane = target.get("vgpr_file_per_lane")
     if wpe and file_lane:
         budget = min(target.get("arch_vgpr_max_per_wave") or file_lane, file_lane // int(wpe))
-        top = max((r.hi + 1 for r in parsed.values() if r.file == "v"), default=0)
+        top = max((p.reg.hi + 1 for p in parsed.values() if p.reg.file == "v"), default=0)
         if top > budget:
             find(
                 "PIN.BUDGET",
@@ -397,20 +412,19 @@ def check(sched: Schedule, target: Optional[TargetDesc] = None, report=None):
                 f"waves_per_eu={wpe} allows",
             )
 
-    # register pressure vs loads the compiler does not track
+    # strict hints vs loads the compiler does not track
     untracked = {q for q, spec in sched.queues.items() if not spec.tracked}
     async_outs = sorted(
         {o for _, secs in _programs(sched) for s in secs for op in s.ops if op.queue in untracked for o in op.outs}
     )
-    if async_outs:
-        n = sum(r.dwords for r in parsed.values())
+    if async_outs and any(p.strict for p in parsed.values()):
         find(
             "PIN.ASYNC_SPILL",
             "warn",
-            f"pins take up to {n} registers from the allocator, and {async_outs} arrive through queues the compiler "
-            "does not track (explicit waits): if the kernel now spills, spill/copy code may read those registers "
-            "before their wait",
-            hint="check ScratchSize == 0 and named_reg.pending_lds_uses on the ISA",
+            f"strict pins restrict the allocator, and {async_outs} arrive through queues the compiler does not "
+            "track (explicit waits): if the kernel spills or copies, that code may read those registers before "
+            "their wait",
+            hint="check the ISA: no scratch, and pins.pending_lds_uses() empty",
         )
 
     # interactions with scheduling hints
@@ -472,27 +486,46 @@ def type_dwords(ty) -> int:
     return total // 32
 
 
-def marker(value, reg: RegRange, mode: str):
-    """One marker on one leaf value; returns the value to use from here on.
+def support_error() -> str:
+    """Why pins cannot be lowered in this process ("" when they can)."""
+    try:
+        from flydsl.expr import rocdl
+    except ImportError as exc:
+        return f"FlyDSL has no ROCDL backend ({exc})"
+    missing = [name for name in _OPS.values() if not hasattr(rocdl, name)]
+    if missing:
+        return f"flydsl.expr.rocdl lacks {missing} (FlyDSL without ROCm/FlyDSL#1307)"
+    return ""
 
-    A DSL numeric (``fx.Float32``, ...) comes back as the same DSL type; anything
-    else as the raw ``ir.Value``.
-    """
-    from flydsl._mlir.dialects import llvm
+
+def require_support():
+    reason = support_error()
+    if reason:
+        raise RuntimeError(f"register pins are not available: {reason}")
+
+
+def _rewrap(original, raw):
+    """A DSL numeric (``fx.Float32``, ...) comes back as the same DSL type, anything else raw."""
+    if raw is original or not hasattr(original, "ir_value"):
+        return raw
+    try:
+        return type(original)(raw)
+    except Exception:  # wrappers that need more than the value (vectors with a shape) stay raw
+        return raw
+
+
+def hint(value, reg: RegRange, strict: bool = True):
+    """``rocdl.sched.{vgpr,agpr,sgpr}`` on one leaf value; returns the hinted value."""
+    from flydsl.expr import rocdl
 
     v = _to_ir(value)
     n = type_dwords(v.type)
     if n != reg.dwords:
         raise ValueError(f"pin {reg}: value of type {v.type} is {n} dwords, the range {reg.dwords}")
     if n not in WIDTHS[reg.file]:
-        raise ValueError(f"pin {reg}: {n} dwords is no {reg.file}-register class on the branch ({WIDTHS[reg.file]})")
-    out = llvm.inline_asm(v.type, [v], marker_text(mode, reg), "=v,0", has_side_effects=False)
-    if v is not value:
-        try:
-            return type(value)(out)
-        except Exception:  # wrappers that need more than the value (vectors with a shape) stay raw
-            return out
-    return out
+        raise ValueError(f"pin {reg}: {n} dwords is no hint width ({WIDTHS[reg.file]}); the backend would drop it")
+    out = getattr(rocdl, _OPS[reg.file])(v, reg.lo, soft=not strict)
+    return _rewrap(value, out)
 
 
 def _leaves(value, out):
@@ -513,25 +546,27 @@ def leaf_dwords(leaf) -> int:
     return type_dwords(_to_ir(leaf).type)
 
 
-def pin_value(value, reg, mode: str, *, mark=None, dwords=None):
-    """Pin ``value`` (a leaf or nested lists of leaves) to ``reg``: leaves take consecutive sub-ranges.
+def pin_value(value, spec, *, mark=None, dwords=None):
+    """Hint ``value`` (a leaf or nested lists of leaves) to ``spec``: leaves take consecutive sub-ranges.
 
-    ``mark(leaf, sub_range, mode)`` emits one marker (default :func:`marker`) and
-    ``dwords(leaf)`` sizes a leaf (default :func:`leaf_dwords`); both are looked up at
-    call time so tests can replace them without MLIR.
+    ``mark(leaf, sub_range, strict)`` emits one hint (default :func:`hint`, after
+    :func:`require_support`) and ``dwords(leaf)`` sizes a leaf (default :func:`leaf_dwords`);
+    tests replace both to run without MLIR.
     """
-    reg = reg if isinstance(reg, RegRange) else RegRange.parse(reg)
+    spec = PinSpec.parse(spec)
     leaves: list = []
     shape = _leaves(value, leaves)
-    mark = mark or marker
+    if mark is None:
+        require_support()
+        mark = hint
     size = dwords or leaf_dwords
     out, off = [], 0
     for leaf in leaves:
         n = size(leaf)
-        out.append(mark(leaf, reg.sub(off, n), mode))
+        out.append(mark(leaf, spec.reg.sub(off, n), spec.strict))
         off += n
-    if off != reg.dwords:
-        raise ValueError(f"pin {reg}: the value has {off} dwords, the range {reg.dwords}")
+    if off != spec.reg.dwords:
+        raise ValueError(f"pin {spec.reg}: the value has {off} dwords, the range {spec.reg.dwords}")
     return _rebuild(shape, iter(out))
 
 
@@ -543,49 +578,205 @@ def carried_pins(sched: Schedule) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for _, secs in _programs(sched):
         for sec in secs:
-            for name, reg in getattr(sec, "pins", {}).items():
-                if out.setdefault(name, reg) != reg:
-                    raise ValueError(f"{sched.name}: carried {name!r} pinned to both {out[name]} and {reg}")
+            for name, spec in getattr(sec, "pins", {}).items():
+                if out.setdefault(name, spec) != spec:
+                    raise ValueError(f"{sched.name}: carried {name!r} pinned to both {out[name]} and {spec}")
     return out
 
 
 def pin_codecs(sched: Schedule, codecs: Mapping, **kw) -> Mapping:
     """``emit_program`` codecs with loop-carried pins applied (``codecs`` unchanged without pins).
 
-    ``pack`` runs on the initial value before the loop and on the new value at the end
-    of the body: the pinned (packed) leaves are written there.  ``unpack`` runs at the
-    top of the body and on the loop results: the leaves are read there.
+    ``pack`` runs on the initial value and on the new value at the end of the body,
+    ``unpack`` on the iteration argument at the top of the body and on the loop result:
+    all four are hinted (the (packed) leaves are what the loop carries).
     """
     pinned = carried_pins(sched)
     if not pinned:
         return codecs
     out = dict(codecs)
-    for name, reg in pinned.items():
+    for name, spec in pinned.items():
         pack, unpack = codecs.get(name, (_identity, _identity))
         out[name] = (
-            lambda v, p=pack, r=reg: pin_value(p(v), r, "write", **kw),
-            lambda v, u=unpack, r=reg: u(pin_value(v, r, "read", **kw)),
+            lambda v, p=pack, s=spec: pin_value(p(v), s, **kw),
+            lambda v, u=unpack, s=spec: u(pin_value(v, s, **kw)),
         )
     return out
 
 
 def pin_inputs(op: Op, env: Mapping, **kw) -> list:
-    """Arguments of ``op``'s binding; values with a live op pin are read from their range."""
-    live = env.get(LIVE_KEY) or {}
-    return [pin_value(env[n], live[n], "read", **kw) if n in live else env[n] for n in op.ins]
+    """Arguments of ``op``'s binding (a hint lives at the definition; reads need nothing)."""
+    return [env[n] for n in op.ins]
 
 
 def pin_outputs(op: Op, env, **kw) -> None:
-    """After ``op``'s results are in ``env``: write pinned outs, end pins of redefined values."""
-    live = env.get(LIVE_KEY) or {}
-    pins = getattr(op, "pins", None) or {}
-    if not pins and not any(o in live for o in op.outs):
-        return
-    live = dict(live)
-    for o in op.outs:
-        if o in pins:
-            env[o] = pin_value(env[o], pins[o], "write", **kw)
-            live[o] = pins[o]
-        else:
-            live.pop(o, None)
-    env[LIVE_KEY] = live
+    """After ``op``'s results are in ``env``: hint its pinned outputs."""
+    for out, spec in (getattr(op, "pins", None) or {}).items():
+        if out in op.outs:
+            env[out] = pin_value(env[out], spec, **kw)
+
+
+# ---------------------------------------------------------------------------------------------
+# ISA placement report (pure text; FLYDSL_DUMP_IR=1 writes *_final_isa.s)
+# ---------------------------------------------------------------------------------------------
+
+_REG_TOKEN = re.compile(r"\b([vas])(?:(\d+)|\[(\d+):(\d+)\])")
+_COPY_OPS = (
+    "v_mov_b32",
+    "v_mov_b64",
+    "v_pk_mov_b32",
+    "v_accvgpr_write_b32",
+    "v_accvgpr_read_b32",
+    "v_accvgpr_mov_b32",
+    "s_mov_b32",
+    "s_mov_b64",
+)
+_NO_DST_PREFIX = ("ds_write", "ds_store", "buffer_store", "global_store", "flat_store", "scratch_store", "s_waitcnt")
+
+
+def _regs(operand: str) -> List[Tuple[str, int, int]]:
+    out = []
+    for m in _REG_TOKEN.finditer(operand):
+        f, one, lo, hi = m.groups()
+        out.append((f, int(one), int(one)) if one is not None else (f, int(lo), int(hi)))
+    return out
+
+
+def _instructions(asm_text: str, kernel: Optional[str] = None):
+    """(block, mnemonic, operands, line) of every instruction (of ``kernel``, if given)."""
+    block, inside = "entry", kernel is None
+    for raw in asm_text.splitlines():
+        s = raw.split(";", 1)[0].strip()
+        if not s:
+            continue
+        if s.endswith(":"):  # function or basic-block label (.LBB0_3)
+            label = s[:-1]
+            if kernel is not None and label == kernel:
+                inside = True
+            elif kernel is not None and label.startswith(".Lfunc_end"):
+                inside = False
+            block = label
+            continue
+        if not inside or s.startswith("."):
+            continue
+        parts = s.split(None, 1)
+        mnem = re.sub(r"_(e32|e64|sdwa|dpp)$", "", parts[0])
+        ops = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
+        yield block, mnem, ops, s
+
+
+@dataclass
+class RangeReport:
+    reg: str
+    writers: Counter = field(default_factory=Counter)  # mnemonic -> instructions defining part of the range
+    readers: Counter = field(default_factory=Counter)
+    # mnemonic -> instructions reading and writing the range (an MFMA accumulating in place)
+    in_place: Counter = field(default_factory=Counter)
+    copies_in: List[str] = field(default_factory=list)  # "block: instruction"
+    copies_out: List[str] = field(default_factory=list)
+
+    @property
+    def placed(self) -> bool:
+        return bool(self.writers or self.readers)
+
+    def summary(self) -> dict:
+        return {
+            "reg": self.reg,
+            "placed": self.placed,
+            "writers": dict(self.writers),
+            "readers": dict(self.readers),
+            "in_place": dict(self.in_place),
+            "copies_in": len(self.copies_in),
+            "copies_out": len(self.copies_out),
+            "copy_blocks": dict(Counter(c.split(":", 1)[0] for c in self.copies_in + self.copies_out)),
+        }
+
+
+def isa_pin_report(asm_text: str, regs: Sequence[str], kernel: Optional[str] = None) -> Dict[str, RangeReport]:
+    """Who writes / reads each pinned range on the ISA, and the copies into / out of it.
+
+    ``copies_in``: a register copy whose destination is in the range and whose source is
+    not (the producer did not write the range directly); ``copies_out``: the reverse (a
+    consumer read a copy).  Both are ``PIN.INDIRECT``.  The first operand of an
+    instruction is taken as its destination (stores and waits have none).
+    """
+    ranges = {r: PinSpec.parse(r).reg for r in regs}
+    reports = {r: RangeReport(str(ranges[r])) for r in regs}
+    for block, mnem, ops, line in _instructions(asm_text, kernel):
+        if not ops:
+            continue
+        has_dst = not mnem.startswith(_NO_DST_PREFIX)
+        dst = _regs(ops[0]) if has_dst else []
+        srcs = [r for o in (ops[1:] if has_dst else ops) for r in _regs(o)]
+        for name, rng in ranges.items():
+
+            def hits(regs, rng=rng):
+                return any(f == rng.file and lo <= rng.hi and rng.lo <= hi for f, lo, hi in regs)
+
+            rep = reports[name]
+            w, r = hits(dst), hits(srcs)
+            if w:
+                rep.writers[mnem] += 1
+            if r:
+                rep.readers[mnem] += 1
+            if w and r:
+                rep.in_place[mnem] += 1
+            if mnem in _COPY_OPS and srcs:  # a copy from a register (an immediate is an initialization)
+                if w and not r:
+                    rep.copies_in.append(f"{block}: {line}")
+                elif r and not w:
+                    rep.copies_out.append(f"{block}: {line}")
+    return reports
+
+
+def mfma_accumulators(asm_text: str, kernel: Optional[str] = None) -> Counter:
+    """Destination register of every MFMA (``"v[128:131]"`` -> count): where accumulators actually live."""
+    out: Counter = Counter()
+    for _, mnem, ops, _ in _instructions(asm_text, kernel):
+        if mnem.startswith("v_mfma") and ops:
+            out[ops[0]] += 1
+    return out
+
+
+_STORE_PREFIX = ("scratch_store", "buffer_store", "global_store", "flat_store", "ds_write")
+
+
+def pending_lds_uses(asm_text: str) -> List[str]:
+    """Instructions that touch the destination of an LDS read before ``s_waitcnt lgkmcnt`` drains it.
+
+    LLVM inserts these waits itself for the loads it emits, not for loads inside inline
+    asm (FlyDSL's ``ds_read_b64_tr_b16`` helpers), whose results the schedule drains with
+    explicit waits.  A copy or spill store the register allocator places between such a
+    load and its wait reads the register before the data arrives -- what strict pins can
+    cause by restricting the allocator.  Heuristic: straight-line program order, ``lgkm``
+    as one FIFO of DS / scalar loads, control flow ignored.
+    """
+    pending: List[set] = []
+    hits = []
+
+    def regset(operands):
+        return {(f, i) for o in operands for f, lo, hi in _regs(o) if f in "va" for i in range(lo, hi + 1)}
+
+    for raw in asm_text.splitlines():
+        s = raw.split(";", 1)[0].strip()
+        if not s or s.startswith(".") or s.endswith(":"):
+            continue
+        parts = s.split(None, 1)
+        mnem = parts[0]
+        ops = [o.strip() for o in parts[1].split(",")] if len(parts) > 1 else []
+        if mnem.startswith("s_waitcnt"):
+            m = re.search(r"lgkmcnt\((\d+)\)", s)
+            if m:
+                n = int(m.group(1))
+                pending = pending[len(pending) - n :] if n else []
+            continue
+        live = set().union(*pending) if pending else set()
+        if mnem.startswith(("ds_read", "ds_write", "s_load", "s_buffer_load")):
+            srcs = regset(ops[1:] if mnem.startswith("ds_read") else ops)
+            if srcs & live:
+                hits.append(s)
+            pending.append(regset(ops[:1]) if mnem.startswith("ds_read") else set())
+            continue
+        if ops and regset(ops) & live:
+            hits.append(s)
+    return hits

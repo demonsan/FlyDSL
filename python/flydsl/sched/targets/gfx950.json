@@ -23,6 +23,8 @@
     "vgpr_alloc_granule":      {"value": 8,      "source": "llvm AMDGPU (gfx90a+ unified file)", "confidence": "inferred"},
     "vgpr_tuple_alignment":    {"value": 2,      "source": "llvm AMDGPU GCNSubtarget::needsAlignedVGPRs (gfx90a and later)", "confidence": "documented",
                                 "note": "VGPR/AGPR tuples of 64 bits or more must start at an even register"},
+    "sgpr_addressable_per_wave": {"value": 102,  "source": "llvm AMDGPU AMDGPUBaseInfo getAddressableNumSGPRs (GFX8-GFX9: 102)", "confidence": "documented",
+                                "note": "s0..s101; VCC follows them; SGPR tuples of 64 bits or more start at an even register"},
 
     "lds_bytes_per_cu":        {"value": 163840, "source": "cdna4-isa", "confidence": "documented"},
     "lds_banks":               {"value": 64,     "source": "cdna4-isa", "confidence": "documented"},

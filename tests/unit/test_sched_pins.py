@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Register pins: Schedule IR declarations, PIN.* verifier rules, lowering markers, LLVM IR rewrite, ISA report.
+"""Register pins: Schedule IR declarations, PIN.* verifier rules, lowering to hints, ISA report.
 
-CPU only: the lowering is driven with a fake marker, and ``flydsl/compiler/named_reg.py``
-(stdlib only) is loaded by path so the test does not import the MLIR-backed compiler package.
+CPU only: the lowering is driven with a fake hint emitter.  The hint ops themselves
+(``rocdl.sched.{vgpr,agpr,sgpr}``) are covered by ``tests/unit/test_schedule_gpr.py``.
 """
 
 import copy
-import importlib.util
+import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -23,9 +25,6 @@ from flydsl.sched.verify import verify
 pytestmark = [pytest.mark.l0_backend_agnostic]
 
 _ROOT = Path(__file__).resolve().parents[2]
-_SPEC = importlib.util.spec_from_file_location("named_reg", _ROOT / "python" / "flydsl" / "compiler" / "named_reg.py")
-named_reg = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(named_reg)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -69,21 +68,26 @@ def target_without_agpr():
 
 
 # ---------------------------------------------------------------------------------------------
-# RegRange
+# specs
 # ---------------------------------------------------------------------------------------------
 
 
-def test_reg_range_parse_and_print():
+def test_reg_range_and_spec_parse():
     r = pins.RegRange.parse("v[192:255]")
     assert (r.file, r.lo, r.hi, r.dwords) == ("v", 192, 255, 64)
     assert str(r) == "v[192:255]" and str(pins.RegRange.parse("a7")) == "a7"
+    assert str(pins.RegRange.parse("s[4:5]")) == "s[4:5]"
     assert str(r.sub(16, 16)) == "v[208:223]"
     assert r.overlaps(pins.RegRange.parse("v255")) and not r.overlaps(pins.RegRange.parse("a[192:255]"))
-    for bad in ("v[3:1]", "s[0:1]", "v[1:2", "x5"):
+    for bad in ("v[3:1]", "x[0:1]", "v[1:2", "x5"):
         with pytest.raises(ValueError):
             pins.RegRange.parse(bad)
     with pytest.raises(ValueError):
         r.sub(60, 8)
+    assert pins.PinSpec.parse("v[8:11]") == pins.PinSpec(pins.RegRange("v", 8, 11), True)
+    assert pins.PinSpec.parse("v[8:11] soft").strict is False and str(pins.PinSpec.parse("v8 soft")) == "v8 soft"
+    with pytest.raises(ValueError):
+        pins.PinSpec.parse("v8 maybe")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -96,48 +100,50 @@ def test_no_pins_no_findings():
     assert not [f for f in rep.findings if f.rule.startswith("PIN.")]
 
 
-def test_carried_pin_ok_is_reserved_for_the_function():
+def test_carried_pin_ok():
     rep = verify(acc_schedule(carried_pin="v[128:143]"))
     assert rep.ok, rep.render()
-    assert "PIN.RESERVED" in rules(rep, "info")
+    assert "PIN.CARRIED" in rules(rep, "info") and "PIN.RESERVED" not in rules(rep)
     assert pins.carried_pins(acc_schedule(carried_pin="v[128:143]")) == {"acc": "v[128:143]"}
 
 
 def test_width_must_match_dwords():
-    rep = verify(acc_schedule(carried_pin="v[128:135]"))
-    assert "PIN.WIDTH" in rules(rep, "error")
+    assert "PIN.WIDTH" in rules(verify(acc_schedule(carried_pin="v[128:135]")), "error")
 
 
-def test_width_without_register_class_is_split():
+def test_widths_without_hint_are_split():
     rep = verify(acc_schedule(carried_pin="v[128:159]", acc_dw=32))
     assert rep.ok and "PIN.SPLIT" in rules(rep, "info")
+    rep = verify(acc_schedule(carried_pin="v[128:130]", acc_dw=3))  # 96 bits: no B96 hint
+    assert "PIN.SPLIT" in rules(rep, "info")
 
 
 def test_out_of_file_and_budget():
     rep = verify(acc_schedule(carried_pin="v[248:263]"))
-    assert "PIN.OUT_OF_FILE" in rules(rep, "error")
-    assert "PIN.BUDGET" in rules(rep, "warn")
+    assert "PIN.OUT_OF_FILE" in rules(rep, "error") and "PIN.BUDGET" in rules(rep, "warn")
+    s = acc_schedule()
+    s.sections[0].ops[0].pins = {"acc": "s[100:115]"}
+    assert "PIN.OUT_OF_FILE" in rules(verify(s), "error")
 
 
 def test_agpr_needs_an_accvgpr_file():
     s = acc_schedule(carried_pin="a[0:15]")
     assert verify(s).ok
-    rep = pins.check(s, target_without_agpr())
-    assert "PIN.NO_AGPR" in rules(rep, "error")
+    assert "PIN.NO_AGPR" in rules(pins.check(s, target_without_agpr()), "error")
 
 
-def test_alignment_and_abi():
-    rep = verify(acc_schedule(carried_pin="v[129:144]"))
-    assert "PIN.ALIGN" in rules(rep, "warn")
-    rep = verify(acc_schedule(carried_pin="v[0:15]"))
-    assert "PIN.ABI" in rules(rep, "warn")
+def test_alignment_strict_vs_soft_and_abi():
+    assert "PIN.ALIGN" in rules(verify(acc_schedule(carried_pin="v[129:144]")), "error")
+    assert "PIN.ALIGN" in rules(verify(acc_schedule(carried_pin="v[129:144] soft")), "warn")
+    assert "PIN.ABI" in rules(verify(acc_schedule(carried_pin="v[0:15]")), "warn")
 
 
 def test_overlap_between_live_pins():
-    # x is defined before the loop and read after it: live across the loop, like the carried pin
+    # x is defined before the loop and read after it: live across the loop, like the carried acc
     rep = verify(acc_schedule(carried_pin="v[128:143]", op_pin="v[140:143]"))
     assert "PIN.OVERLAP" in rules(rep, "error")
-    assert "PIN.RESERVED" in rules(rep, "info")
+    rep = verify(acc_schedule(carried_pin="v[128:143]", op_pin="v[140:143] soft"))
+    assert "PIN.OVERLAP" in rules(rep, "warn") and rep.ok
     assert verify(acc_schedule(carried_pin="v[128:143]", op_pin="v[144:147]")).ok
 
 
@@ -155,10 +161,12 @@ def test_overlap_respects_lifetimes():
     assert "PIN.OVERLAP" in rules(verify(s), "error")
 
 
-def test_unknown_values_and_carried_op_pins():
-    s = acc_schedule()
-    s.sections[1].ops[1].pins = {"acc": "v[128:143]"}  # acc is loop-carried: pin the loop instead
-    assert "PIN.CARRIED_OP_PIN" in rules(verify(s), "error")
+def test_unknown_values_and_conflicts():
+    s = acc_schedule(carried_pin="v[128:143]")
+    s.sections[1].ops[1].pins = {"acc": "v[128:143]"}  # an op pin agreeing with the loop: fine
+    assert verify(s).ok
+    s.sections[1].ops[1].pins = {"acc": "v[144:159]"}
+    assert "PIN.CONFLICT" in rules(verify(s), "error")
     s = acc_schedule()
     s.sections[0].ops[0].pins = {"nope": "v[128:143]"}
     assert "PIN.UNKNOWN_VALUE" in rules(verify(s), "error")
@@ -176,19 +184,20 @@ def test_async_and_sched_interactions():
     s.sections[1].ops.insert(0, Op(kind="wait", label="w", args={"vm": 0}))
     s.sections[1].ops.append(Op(kind="sched_group", label="sg", args={"cls": "mfma", "size": 1, "group": 0}))
     rep = pins.check(s)
-    assert "PIN.ASYNC_SPILL" in rules(rep, "warn")
-    assert "PIN.SCHED" in rules(rep, "info")
+    assert "PIN.ASYNC_SPILL" in rules(rep, "warn") and "PIN.SCHED" in rules(rep, "info")
+    s.sections[1].pins = {"acc": "v[128:143] soft"}
+    assert "PIN.ASYNC_SPILL" not in rules(pins.check(s))  # only strict hints restrict the allocator
 
 
 def test_pinned_mha_schedule_verifies():
     from kernels.attention.sched.mha_gfx950_pinned import PRESETS, build_pinned_mha_schedule
 
+    assert {"o", "ml", "o_soft", "ml_soft"} <= set(PRESETS)
     for preset in PRESETS:
         s = build_pinned_mha_schedule(preset, head_dim=128, causal=False)
         rep = verify(s)
         assert rep.ok, rep.render()
-        assert s.name.endswith(f"_pin_{preset}")
-        assert pins.has_pins(s)
+        assert s.name.endswith(f"_pin_{preset}") and pins.has_pins(s)
     base = build_pinned_mha_schedule({"v_o": "v[192:255]"}).sections
     assert [getattr(sec, "pins", {}) for sec in base if sec.loop is None] == [{}, {}]
 
@@ -197,34 +206,38 @@ def test_fingerprint_sees_pins():
     from flydsl.sched.program import schedule_fingerprint
 
     assert schedule_fingerprint(acc_schedule()) != schedule_fingerprint(acc_schedule(carried_pin="v[128:143]"))
+    assert schedule_fingerprint(acc_schedule(carried_pin="v[128:143]")) != schedule_fingerprint(
+        acc_schedule(carried_pin="v[128:143] soft")
+    )
 
 
 # ---------------------------------------------------------------------------------------------
-# lowering (fake markers)
+# lowering (fake hints)
 # ---------------------------------------------------------------------------------------------
 
 
 @pytest.fixture
-def fake_markers(monkeypatch):
+def fake_hints(monkeypatch):
     calls = []
 
-    def mark(leaf, reg, mode):
-        calls.append((mode, str(reg), leaf))
-        return f"{mode}({leaf})@{reg}"
+    def mark(leaf, reg, strict):
+        calls.append((str(reg), strict, leaf))
+        return f"h({leaf})@{reg}{'' if strict else '~'}"
 
-    monkeypatch.setattr(pins, "marker", mark)
+    monkeypatch.setattr(pins, "hint", mark)
     monkeypatch.setattr(pins, "leaf_dwords", lambda leaf: 16)
+    monkeypatch.setattr(pins, "support_error", lambda: "")
     return calls
 
 
-def test_pin_value_splits_leaves(fake_markers):
-    out = pins.pin_value(["o0", ("o1", "o2"), "o3"], "v[192:255]", "write")
-    assert out == ["write(o0)@v[192:207]", ("write(o1)@v[208:223]", "write(o2)@v[224:239]"), "write(o3)@v[240:255]"]
+def test_pin_value_splits_leaves(fake_hints):
+    out = pins.pin_value(["o0", ("o1", "o2"), "o3"], "v[192:255] soft")
+    assert out == ["h(o0)@v[192:207]~", ("h(o1)@v[208:223]~", "h(o2)@v[224:239]~"), "h(o3)@v[240:255]~"]
     with pytest.raises(ValueError):
-        pins.pin_value(["o0", "o1"], "v[192:255]", "read")  # 32 of 64 dwords
+        pins.pin_value(["o0", "o1"], "v[192:255]")  # 32 of 64 dwords
 
 
-def test_carried_pin_codecs_through_emit_program(fake_markers):
+def test_carried_pin_codecs_through_emit_program(fake_hints):
     sched = acc_schedule(carried_pin="v[128:143]")
     log = []
     bindings = {
@@ -242,29 +255,23 @@ def test_carried_pin_codecs_through_emit_program(fake_markers):
         loop_impl=python_loop,
         primitives=object(),
     )
-    modes = [m for m, _, _ in fake_markers]
-    # init written before the loop; per iteration read at the top, written at the end; read after the loop
-    assert modes == ["write", "read", "write", "read", "write", "read"]
-    assert {r for _, r, _ in fake_markers} == {"v[128:143]"}
+    # init hinted before the loop; per iteration the argument at the top and the new value at the end; the result
+    assert [r for r, _, _ in fake_hints] == ["v[128:143]"] * 6 and all(s for _, s, _ in fake_hints)
     assert log == [
-        "read(write(mma(a1,read(write(mma(a0,read(write(zero)@v[128:143])@v[128:143]))@v[128:143])@v[128:143]))@v[128:143])@v[128:143]"
+        "h(h(mma(a1,h(h(mma(a0,h(h(zero)@v[128:143])@v[128:143]))@v[128:143])@v[128:143]))@v[128:143])@v[128:143]"
     ]
 
 
-def test_op_pins_read_at_every_use(fake_markers):
-    env = {}
-    op_def = Op(kind="valu", binding="f", outs=("p", "q"), pins={"p": "v[64:79]"})
-    env.update(p="P", q="Q")
-    pins.pin_outputs(op_def, env)
-    assert env["p"] == "write(P)@v[64:79]" and env["q"] == "Q"
-    use = Op(kind="valu", binding="g", ins=("p", "q"), outs=("p",))
-    assert pins.pin_inputs(use, env) == ["read(write(P)@v[64:79])@v[64:79]", "Q"]
-    env["p"] = "P2"  # redefined without a pin: later reads are plain
-    pins.pin_outputs(use, env)
-    assert pins.pin_inputs(Op(kind="valu", binding="h", ins=("p",)), env) == ["P2"]
+def test_op_pins_hint_the_definition(fake_hints):
+    env = {"p": "P", "q": "Q"}
+    op = Op(kind="valu", binding="f", outs=("p", "q"), pins={"p": "v[64:79]"})
+    pins.pin_outputs(op, env)
+    assert env == {"p": "h(P)@v[64:79]", "q": "Q"}
+    use = Op(kind="valu", binding="g", ins=("p", "q"))
+    assert pins.pin_inputs(use, env) == ["h(P)@v[64:79]", "Q"]  # reads need nothing
 
 
-def test_op_pins_through_lower_emit(fake_markers):
+def test_op_pins_through_lower_emit(fake_hints):
     from flydsl.sched.lower import emit
 
     b = Builder()
@@ -273,7 +280,7 @@ def test_op_pins_through_lower_emit(fake_markers):
     b.op("valu", "g", ins=("p",), outs=("q",))
     seen = []
     emit(b.ops, {"f": lambda: "P", "g": lambda p: seen.append(p) or "Q"}, {}, primitives=object())
-    assert seen == ["read(write(P)@v[64:79])@v[64:79]"]
+    assert seen == ["h(P)@v[64:79]"]
 
 
 def test_no_pins_is_a_no_op():
@@ -283,63 +290,31 @@ def test_no_pins_is_a_no_op():
     op = Op(kind="valu", binding="f", ins=("a",), outs=("b",))
     assert pins.pin_inputs(op, env) == [1]
     pins.pin_outputs(op, env)
-    assert pins.LIVE_KEY not in env
+    assert env == {"a": 1}
+
+
+def test_support_error_names_the_missing_ops(monkeypatch):
+    fake = types.ModuleType("flydsl.expr.rocdl")
+    fake.sched_vgpr = object()
+    expr = types.ModuleType("flydsl.expr")
+    expr.rocdl = fake
+    monkeypatch.setitem(sys.modules, "flydsl.expr", expr)
+    monkeypatch.setitem(sys.modules, "flydsl.expr.rocdl", fake)
+    assert "sched_agpr" in pins.support_error() and "sched_sgpr" in pins.support_error()
+    fake.sched_agpr = fake.sched_sgpr = object()
+    assert pins.support_error() == ""
+
+
+def test_required_llvm_patch_is_declared():
+    info = json.loads((_ROOT / "thirdparty" / "llvm-build-info.json").read_text(encoding="utf-8"))["upstream"]
+    assert "schedule-bank-and-gpr.patch" in [e["file"] for e in info["required_patches"]]
+    patch = (_ROOT / "thirdparty" / "llvm-extensions" / "schedule-bank-and-gpr.patch").read_text(encoding="utf-8")
+    for name in ("int_amdgcn_sched_vgpr", "int_amdgcn_sched_agpr", "int_amdgcn_sched_sgpr", "V_SCHEDULE_VGPR_B512"):
+        assert name in patch
 
 
 # ---------------------------------------------------------------------------------------------
-# LLVM IR rewrite
-# ---------------------------------------------------------------------------------------------
-
-_LL = """\
-define amdgpu_kernel void @k(ptr addrspace(1) %0) {
-  %2 = call <16 x float> asm ";flydsl.pin.write v[128:143]", "=v,0"(<16 x float> zeroinitializer)
-  br label %3
-3:
-  %4 = phi <16 x float> [ %2, %1 ], [ %8, %3 ]
-  %5 = call <16 x float> asm ";flydsl.pin.read v[128:143]", "=v,0"(<16 x float> %4), !dbg !7
-  %6 = fadd <16 x float> %5, %5
-  %8 = call <16 x float> asm ";flydsl.pin.write v[128:143]", "=v,0"(<16 x float> %6)
-  %9 = call i32 asm sideeffect ";flydsl.pin.read a5", "=v,0"(i32 %x)
-  %10 = call <8 x bfloat> asm ";flydsl.pin.write v[4:7]", "=v,0"(<8 x bfloat> splat (bfloat 0xR3F80))
-  br label %3
-}
-!7 = !{}
-"""
-
-
-def test_rewrite_markers_to_named_register_intrinsics():
-    res = named_reg.rewrite_markers(_LL)
-    t = res.text
-    assert (res.reads, res.writes) == (2, 3)
-    assert res.regs == {"v[128:143]": 16, "a5": 1, "v[4:7]": 4}
-    assert ";flydsl.pin" not in t
-    assert "%pin_2_i = bitcast <16 x float> zeroinitializer to <16 x i32>" in t
-    assert "call void @llvm.write_register.v16i32(metadata !8, <16 x i32> %pin_2_i)" in t
-    assert "%2 = bitcast <16 x float> zeroinitializer to <16 x float>" in t
-    assert "%pin_5_r = call <16 x i32> @llvm.read_register.v16i32(metadata !8), !dbg !7" in t
-    assert "%5 = bitcast <16 x i32> %pin_5_r to <16 x float>, !dbg !7" in t
-    assert "%pin_9_r = call i32 @llvm.read_register.i32(metadata !9)" in t  # i32 needs no bitcast type change
-    assert "bitcast <8 x bfloat> splat (bfloat 0xR3F80) to <4 x i32>" in t
-    assert "declare void @llvm.write_register.v16i32(metadata, <16 x i32>)" in t
-    assert "declare <16 x i32> @llvm.read_register.v16i32(metadata)" in t
-    assert "declare void @llvm.write_register.v4i32(metadata, <4 x i32>)" in t
-    for i, reg in ((8, "v[128:143]"), (9, "a5"), (10, "v[4:7]")):
-        assert f'!{i} = !{{!"{reg}"}}' in t
-
-
-def test_rewrite_strip_and_errors():
-    t = named_reg.rewrite_markers(_LL, mode="strip").text
-    assert "read_register" not in t and ";flydsl.pin" not in t
-    assert "%5 = bitcast <16 x float> %4 to <16 x float>, !dbg !7" in t
-    assert named_reg.ir_type_dwords("<8 x bfloat>") == 4 and named_reg.ir_type_dwords("double") == 2
-    with pytest.raises(ValueError):
-        named_reg.ir_type_dwords("<3 x half>")
-    with pytest.raises(ValueError):
-        named_reg.rewrite_markers(_LL, mode="nope")
-
-
-# ---------------------------------------------------------------------------------------------
-# ISA checks
+# ISA report
 # ---------------------------------------------------------------------------------------------
 
 _ASM = """\
@@ -358,15 +333,15 @@ k:
 
 
 def test_isa_pin_report():
-    rep = named_reg.isa_pin_report(_ASM, ["v[128:131]", "v[132:147]", "v[200:201]"], kernel="k")
+    rep = pins.isa_pin_report(_ASM, ["v[128:131]", "v[132:147] soft", "v[200:201]"], kernel="k")
     acc = rep["v[128:131]"].summary()
     assert acc["placed"] and acc["in_place"] == {"v_mfma_f32_16x16x32_bf16": 1}
     assert acc["copies_in"] == acc["copies_out"] == 0  # the immediate init is not a copy
     assert acc["readers"]["buffer_store_dwordx4"] == 1
-    other = rep["v[132:147]"].summary()
-    assert (other["copies_in"], other["copies_out"]) == (1, 1)
-    assert other["copy_blocks"] == {".LBB0_1": 2}
+    other = rep["v[132:147] soft"].summary()
+    assert (other["copies_in"], other["copies_out"]) == (1, 1) and other["copy_blocks"] == {".LBB0_1": 2}
     assert not rep["v[200:201]"].placed
+    assert pins.mfma_accumulators(_ASM) == {"v[128:131]": 1, "v[12:27]": 1}
 
 
 def test_pending_lds_uses():
@@ -375,9 +350,9 @@ def test_pending_lds_uses():
     partial = (
         "ds_read_b128 v[4:7], v1\nds_read_b128 v[8:11], v1\ns_waitcnt lgkmcnt(1)\nv_mov_b32 v0, v4\nv_mov_b32 v0, v8\n"
     )
-    assert named_reg.pending_lds_uses(ok) == []
-    assert named_reg.pending_lds_uses(bad) == ["scratch_store_dwordx2 off, v[4:5], off"]
-    assert named_reg.pending_lds_uses(partial) == ["v_mov_b32 v0, v8"]
+    assert pins.pending_lds_uses(ok) == []
+    assert pins.pending_lds_uses(bad) == ["scratch_store_dwordx2 off, v[4:5], off"]
+    assert pins.pending_lds_uses(partial) == ["v_mov_b32 v0, v8"]
 
 
 def test_schedule_copy_is_independent():
@@ -385,13 +360,3 @@ def test_schedule_copy_is_independent():
     c = copy.deepcopy(s)
     c.sections[1].pins = {"acc": "v[128:143]"}
     assert not pins.has_pins(s) and pins.has_pins(c)
-
-
-def test_validated_pin_llvm_is_recorded_consistently():
-    """The LLVM revision pins were validated with is stated once in code and matches pins / docs."""
-    rec = named_reg.PIN_LLVM
-    assert rec["branch"] == "amdgpu-named-reg-pin-std" and rec["llvm_version"] == "24.0.0git"
-    assert len(rec["commit"]) == 40 and rec["commit"] in pins.BRANCH
-    doc = (_ROOT / "docs" / "sched_ir_guide.md").read_text(encoding="utf-8")
-    for key in ("commit", "upstream_base", "llvm_version"):
-        assert rec[key] in doc

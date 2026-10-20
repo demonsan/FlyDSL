@@ -7,9 +7,9 @@
     python tools/named_reg/mha_pinned_run.py --pins o [--bench 50]
 
 Correctness: a small shape against an fp32 reference and the timed shape against
-``torch.nn.functional.scaled_dot_product_attention``.  Use through
-``tools/named_reg/named_reg.py`` (prepare / build / run) to execute the binary the pin
-branch's ``llc`` produced; run directly, the pin markers are no-ops.
+``torch.nn.functional.scaled_dot_product_attention``.  Pins are register-allocation hints
+(``rocdl.sched.*``, strict unless a spec ends in " soft"); check placement on the
+``FLYDSL_DUMP_IR=1`` ISA with ``tools/named_reg/isa_report.py``.
 """
 
 import argparse
