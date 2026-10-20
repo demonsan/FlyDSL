@@ -64,13 +64,27 @@ def build_schedule(pin=None, shape="32x32x16") -> Schedule:
     )
 
 
-def build_kernel(sched: Schedule, shape="32x32x16"):
+def _clobber_vgpr(reg):
+    """An empty inline asm that clobbers ``v<reg>``: raises the kernel's VGPR count, emits no instruction."""
+    if reg is None:
+        return
+    from flydsl._mlir.dialects import llvm
+
+    llvm.inline_asm(None, [], "", f"~{{v{reg}}}", has_side_effects=True)
+
+
+def build_kernel(sched: Schedule, shape="32x32x16", lds: int = 0, clobber_vgpr=None):
+    """``lds``: dynamic LDS bytes per block (unused by the kernel; caps blocks per CU).
+
+    ``clobber_vgpr``: raise the VGPR count to ``clobber_vgpr + 1`` without a pin (occupancy control).
+    """
     acc_dw = SHAPES[shape][1]
     mfma = getattr(rocdl, f"mfma_f32_{shape}_bf16")
     report = verify(sched)  # includes the PIN.* rules
     if not report.ok:
         raise ValueError(str(report))
-    cache_tag = (sched.name, schedule_fingerprint(sched))
+    cache_tag = (sched.name, schedule_fingerprint(sched), lds, clobber_vgpr)
+    launch_kw = {"smem": lds} if lds else {}
 
     @flyc.kernel(known_block_size=[LANES, 1, 1])
     def mfma_acc_kernel(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, steps: fx.Int32):
@@ -81,6 +95,7 @@ def build_kernel(sched: Schedule, shape="32x32x16"):
         c_rsrc = buffer_ops.create_buffer_resource(C)
         n_steps = fx.Index(steps)
         acc_ty = Vec.make_type(acc_dw, fx.Float32)
+        _clobber_vgpr(clobber_vgpr)
 
         def frag(rsrc, k):
             elem = ((blk * n_steps + k) * LANES + lane) * 8
@@ -112,7 +127,9 @@ def build_kernel(sched: Schedule, shape="32x32x16"):
         A: fx.Tensor, B: fx.Tensor, C: fx.Tensor, steps: fx.Int32, blocks: fx.Int32, stream: fx.Stream = fx.Stream(None)
     ):
         _ = cache_tag
-        mfma_acc_kernel(A, B, C, steps).launch(grid=(fx.Index(blocks), 1, 1), block=(LANES, 1, 1), stream=stream)
+        mfma_acc_kernel(A, B, C, steps).launch(
+            grid=(fx.Index(blocks), 1, 1), block=(LANES, 1, 1), stream=stream, **launch_kw
+        )
 
     return launch
 
@@ -158,10 +175,15 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=256)
     ap.add_argument("--shape", choices=sorted(SHAPES), default="32x32x16")
     ap.add_argument("--bench", type=int, default=0, help="timed iterations (0: correctness only)")
+    ap.add_argument(
+        "--lds", type=int, default=0, help="dynamic LDS bytes per block: caps resident blocks (occupancy control)"
+    )
+    ap.add_argument("--clobber-vgpr", type=int, default=None, help="raise the VGPR count without a pin")
+    ap.add_argument("--no-check", action="store_true", help="skip the reference check (large grids)")
     args = ap.parse_args(argv)
     pin = f"{args.pin} soft" if args.pin and args.soft else args.pin
     sched = build_schedule(pin, args.shape)
-    launch = build_kernel(sched, args.shape)
+    launch = build_kernel(sched, args.shape, args.lds, args.clobber_vgpr)
     m, acc_dw = SHAPES[args.shape]
     torch.manual_seed(0)
     n = args.blocks * args.steps * LANES * 8
@@ -170,14 +192,17 @@ def main(argv=None):
     C = torch.zeros(args.blocks * LANES * acc_dw, device="cuda", dtype=torch.float32)
     launch(A, B, C, args.steps, args.blocks)
     torch.cuda.synchronize()
-    ref = reference(A, B, args.blocks, args.steps, args.shape).reshape(-1)
-    err = (C - ref).abs().max().item()
-    ok = torch.allclose(C, ref, atol=1e-2, rtol=1e-3)
-    print(f"{sched.name}: max_abs_err={err:.3e} {'PASS' if ok else 'FAIL'}")
+    ok = True
+    if not args.no_check:
+        ref = reference(A, B, args.blocks, args.steps, args.shape).reshape(-1)
+        err = (C - ref).abs().max().item()
+        ok = torch.allclose(C, ref, atol=1e-2, rtol=1e-3)
+        print(f"{sched.name}: max_abs_err={err:.3e} {'PASS' if ok else 'FAIL'}")
     if args.bench:
         us = bench(lambda: launch(A, B, C, args.steps, args.blocks), args.bench)
         flops = 2 * m * m * (8 * LANES // m) * args.steps * args.blocks
-        print(f"BENCH {sched.name} {us:.2f} us {flops / us / 1e6:.1f} TFLOP/s")
+        moved = 2 * n * 2  # A and B, bf16
+        print(f"BENCH {sched.name} {us:.2f} us {flops / us / 1e6:.1f} TFLOP/s {moved / us / 1e6:.2f} TB/s")
     return 0 if ok else 1
 
 

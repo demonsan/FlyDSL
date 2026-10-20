@@ -499,8 +499,36 @@ Setup:
   cost is at most +0.14%, even though the kernel's VGPR count rises to 256. The register
   count does not limit this kernel. The copies are outside the loop. The remaining
   cost is at D=128, from the 6 spilled VGPRs and the copies.
-* **Demo cost.** The cost at `v128` is occupancy only (132/144 VGPRs). Low registers and
-  AGPRs cost nothing.
+* **Demo cost.** Low registers and AGPRs cost nothing. Pinning to `v128` costs 9-11% at 4096
+  blocks. The section below explains why.
+
+**Why high pins cost on this demo** (MI355X GPU 3, 2026-10-20, clocks not pinned):
+* **The code is the same.** The hot loop is identical to the unpinned one apart from register
+  numbers (29 instructions). What changes is the VGPR count: 132 (16x16) / 144 (32x32)
+  instead of 32 / 40. With a 512-entry unified file in granules of 8, that allows 3 waves per
+  SIMD instead of 8.
+* **Occupancy-only control.** An unpinned kernel with an empty inline asm that clobbers
+  `v131` / `v143` has the same loop and the same VGPR count. It reproduces the pinned time at
+  every grid size (within 0.6%). So the cost comes from occupancy alone.
+* **Grid sweep.** One wave per block, 1024 SIMDs; 3 rounds, 20 launches each. Time ratio of
+  the high pin to the unpinned kernel:
+
+  | waves per SIMD (blocks / 1024) | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 12 | 16 |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | 16x16, 512 steps | 1.00 | 1.00 | 1.00-1.01 | 1.09-1.10 | | 1.00 | | | | |
+  | 16x16, 128 steps | | | | 1.06 | 1.02 | 0.98 | 1.04 | 1.01 | 0.99 | 1.02 |
+  | 32x32, 512 steps | 1.02 | 1.00 | 1.00 | 1.10-1.11 | | 1.00 | | | | |
+  | 32x32, 128 steps | | | | 1.06 | 1.02 | 0.99 | 1.05 | 1.02 | 0.99 | 1.01 |
+
+* **Interpretation.** The sawtooth is residency quantization: whenever the waves per SIMD
+  divide by 3, the gap is zero. In between, the kernel runs one more round with too few
+  waves to saturate memory. At 4 waves per SIMD the last round has a single wave per SIMD,
+  and one wave per SIMD reaches only 4.8 TB/s against 5.6-5.8 TB/s. Three resident waves per
+  SIMD sustain the same bandwidth as eight: at 6 and 12 waves per SIMD the pinned kernel is
+  equal or 1-2% faster. So "fewer loads in flight per SIMD" is not the cause here.
+* **The default grid.** The demo's default of 4096 blocks happens to hit the worst case.
+* **Consequence.** A pin above the occupancy budget is free only when the grid fills whole
+  rounds at the reduced occupancy. The `PIN.BUDGET` warning flags pins above the budget.
 * **AGPR pins.** A strict `a[0:3]` holds only partly (copies), while soft holds fully; this
   is the allocator's choice between the AGPR and VGPR MFMA forms.
 * **Shared initial values.** Two leaves initialized by the same constant are CSE'd into one
