@@ -400,8 +400,10 @@ the `flydsl==0.4.0` wheel's `_mlir` with this branch's Python, clocks not pinned
 
 `flydsl.sched.pins` turns "place this value in `v[a:b]`" into schedule data. A pin
 is a **register-allocation hint at the value's definition**. The mechanism is
-ROCm/FlyDSL#1307 (`rocdl.sched.{vgpr,agpr,sgpr}`, the required LLVM patch
-`thirdparty/llvm-extensions/schedule-bank-and-gpr.patch` on the pinned LLVM). It replaced an
+ROCm/FlyDSL#1307 (`rocdl.sched.{vgpr,agpr,sgpr}`). It needs two required LLVM patches on
+the pinned LLVM `1df311a6` (`thirdparty/llvm-build-info.json`):
+`thirdparty/llvm-extensions/schedule-bank-and-gpr.patch` (the PR's) and
+`thirdparty/llvm-extensions/schedule-gpr-hint-coalescing.patch` (our fix on top of it). It replaced an
 earlier version built on `llvm.read_register` / `llvm.write_register` and a named-register
 LLVM branch (user decision, 2026-10-20).
 
@@ -424,8 +426,12 @@ b.op("vmem_load", "load_x", outs=("x",), out_dwords={"x": 4}, pins={"x": "v[64:6
 **How the hint works.** `rocdl.sched.vgpr %v, regnum [soft]` is an identity op. It lowers
 to `llvm.amdgcn.sched.vgpr` and a pseudo. The pre-RA `AMDGPUSchedBank` pass replaces the
 pseudo with a COPY and puts the hint on both sides of it. The hint is propagated through
-COPY / REG_SEQUENCE / INSERT_SUBREG / SUBREG_TO_REG.
-* A strict hint is a hard hint: `getRegAllocationHints` returns only that register.
+COPY / REG_SEQUENCE / INSERT_SUBREG / SUBREG_TO_REG. When the coalescer merges a hinted
+register into another, `schedule-gpr-hint-coalescing.patch` (`SIRegisterInfo::updateRegAllocHint`)
+moves the hint onto the register it keeps. Without that, a hint on a loop-carried value is
+lost when its phi is coalesced.
+* A strict hint is a hard hint: `getRegAllocationHints` returns only that register. A soft
+  hint never replaces a strict one.
 * A soft hint moves the register to the front of the allocation order.
 * Widths are 32/64/128/256/512 bits. Wider values are split into leaves on consecutive
   sub-ranges. The backend silently drops a hint of any other width, so the verifier
@@ -457,66 +463,63 @@ its wait. `tools/named_reg/isa_report.py <final_isa.s> <ranges>` prints all thre
 ### Results (MI355X GPU 3, 2026-10-20)
 
 Setup:
-* LLVM `1df311a6` + the required patches (incl. `schedule-bank-and-gpr.patch`), built with
-  `scripts/build_llvm.sh` (`amd-minimal`) and `scripts/build.sh`. ROCm 7.2.4 container.
+* Clean build from scratch with `scripts/build_llvm.sh` (`amd-minimal`, fresh clone of
+  `1df311a6` plus the four required patches) and `scripts/build.sh`. ROCm 7.2.4 container.
+* lit:
+  * `sched-gpr-hint-coalescing.ll` passes, and fails with the PR patch alone.
+  * `sched-gpr-hints.mir`, `sched-bank.ll`, `sched-bank-hints.mir` pass.
+  * `sched-gpr.ll` fails at its gfx1250 `v[512:527]` case. That failure is in the PR patch
+    alone too, so it was there before our patch.
+* pytest: `test_schedule_gpr/bank`, `test_sched_*` and `test_llvm_extension_*` pass (209);
+  `test_flash_attn_sched_gfx950.py` passes (46).
 * Every variant is correct (fp32 reference / SDPA).
+* With no pins, the patches change nothing: the unpinned MHA ISA (D=128 and D=64) is
+  identical to that of the same LLVM hash built without either patch.
 * Timing: bf16; median of 30 launches per process; 5 interleaved rounds. The table gives
   the median of the round medians and the round range.
-* With no pins, the patch changes nothing: the unpinned MHA ISA (D=128 and D=64) is
-  identical to that of the same LLVM hash built without `schedule-bank-and-gpr.patch`.
 
 | kernel | pin | where the value lives (ISA) | us |
 |---|---|---|---|
-| demo 16x16x32, 4096 blocks x 512 steps | none | acc in `v[0:3]` | 753.7 [749.6-761.8] |
-| | `v[128:131]` strict / soft | acc in `v[128:131]`, in place, 0 copies; 132 VGPRs | 826.0 / 829.1 |
-| | `v[8:11]` | acc in `v[8:11]`, in place, 0 copies | 754.4 |
-| | `a[0:3]` strict | **not honoured**: acc stays in VGPRs | 753.0 |
-| | `a[0:3]` soft | 4 of 5 MFMAs in `a[0:3]`, 4+4 copies | 751.7 |
-| demo 32x32x16, same | none | acc in `v[2:17]` | 767.0 [765.8-775.1] |
-| | `v[128:143]` strict / soft | acc in `v[128:143]`, in place, 0 copies; 144 VGPRs | 875.1 / 879.6 |
-| | `a[0:15]` strict | acc in `a[0:15]` (AGPR-form MFMA), in place | 768.6 |
-| MHA D=128 B4 S8192 H64 | none | | 7425.6 [7422.7-7440.7] |
-| | `ml` (`v190`/`v191`) | ISA differs from unpinned by 5 lines, no sign of the hint | 7430.9 |
-| | `o` (`v[192:255]`) | **not honoured**: accumulators stay in `v[0:95]` | 7428.5 |
-| MHA D=64 B4 S8192 H32 | none | | 2371.6 [2369.5-2375.5] |
-| | `v_o` → `v[224:255]` | **not honoured**: nothing uses `v224+`; same ISA as `v[32:63]` | 2373.0 |
+| demo 16x16x32, 4096 blocks x 512 steps | none | acc in `v[0:3]` | 754.2 [750.9-762.4] |
+| | `v[128:131]` | acc in `v[128:131]`, in place, 0 copies; 132 VGPRs | 829.9 [826.9-856.2] |
+| | `v[8:11]` | acc in `v[8:11]`, in place, 0 copies | 754.3 |
+| | `a[0:3]` strict | 3 of 5 MFMAs in `a[0:3]`, 4+4 accvgpr copies | 754.4 |
+| | `a[0:3]` soft | all 5 MFMAs in `a[0:3]`, in place, 0 copies | 753.4 |
+| demo 32x32x16, same | none | acc in `v[2:17]` | 774.1 [766.1-777.0] |
+| | `v[128:143]` | acc in `v[128:143]`, in place, 0 copies; 144 VGPRs | 877.3 [851.5-880.0] |
+| | `a[0:15]` | acc in `a[0:15]` (AGPR-form MFMA), in place | 774.2 |
+| MHA D=128 B4 S8192 H64 | none | | 7435.8 [7432.1-7440.2] |
+| | `ml` (`v190`/`v191`) | row max / row sum in `v190`/`v191`, 2 copies | 7435.0 [7427.8-7437.4] |
+| | `o` (`v[192:255]`) strict / soft | the 48 PV MFMAs accumulate in place in `v[192:255]`; no copies in the loop: the 56 copies in (48 out) are the shared zero initializer broadcast from `v[240:255]` to the other leaves before the loop and on the zero-trip path; 256 VGPRs, 6 spilled (28 B scratch, no LDS-read hazards) | 7446.4 [7441.2-7451.3] / 7447.1 (+0.14%) |
+| MHA D=64 B4 S8192 H32 | none | | 2372.5 [2371.8-2378.2] |
+| | `v_o` → `v[224:255]` strict / soft | the 24 PV MFMAs accumulate in place in `v[224:255]`; copies (24 in, 16 out) only outside the loop; 256 VGPRs | 2374.8 [2368.7-2375.8] (+0.1%) |
+| | `v_o` → `v[32:63]` | PV accumulators in `v[32:63]`; 164 VGPRs | 2372.1 |
 
-* **Where hints work.** Hints are honoured when the hinted virtual register survives
-  register coalescing. That happens in the one-block demo loop. There, strict pins even
-  keep a 32x32 accumulator in place, which the earlier named-register path could not
-  (it needed 24+40 copies). The demo's cost at `v128` is occupancy only: 132/144 VGPRs. At
-  low registers or in AGPRs the cost is zero.
-* **Where they are lost.** In the MHA, the loop-carried values become phis. The coalescer
-  merges the hinted virtual registers into the phi-elimination registers, and the target
-  hint does not move with them. `llc -debug-only=amdgpu-sched-bank,regalloc` shows this:
-  the hint `reg 240 strict` is set on `%2733`, but greedy then allocates the merged `%5308`
-  with only a copy hint (`$vgpr0..15`). So **with the PR patch alone, a pin on a
-  loop-carried value in a real kernel does not get its register, strict or not**. The hints
-  still change codegen slightly; the time is unchanged within noise.
+* **Hints now hold on loop-carried values**, strict or soft. On the MHA O accumulator the
+  cost is at most +0.14%, even though the kernel's VGPR count rises to 256. The register
+  count does not limit this kernel. The copies are outside the loop. The remaining
+  cost is at D=128, from the 6 spilled VGPRs and the copies.
+* **Demo cost.** The cost at `v128` is occupancy only (132/144 VGPRs). Low registers and
+  AGPRs cost nothing.
+* **AGPR pins.** A strict `a[0:3]` holds only partly (copies), while soft holds fully; this
+  is the allocator's choice between the AGPR and VGPR MFMA forms.
 * **Shared initial values.** Two leaves initialized by the same constant are CSE'd into one
-  value before the loop. Their two hints then land on one virtual register, and the second
-  hint is dropped.
+  value before the loop. Their two hints then land on one virtual register. With the
+  coalescing fix every leaf still gets its range, through copies before the loop.
+* **With the PR patch alone** (measured the same day, before the fix):
+  * In the one-block demo the hints held.
+  * In the MHA no loop-carried pin got its register (`o`, `ml`, D=64 `v_o`). The
+    coalescer merged the hinted registers into the phi-elimination registers and dropped
+    the target hint. `llc -debug-only=amdgpu-sched-bank,regalloc` shows `reg 240 strict`
+    set on `%2733`, and greedy then allocating the merged `%5308` with only a copy hint.
+  * `schedule-gpr-hint-coalescing.patch` fixes this, and its lit test reproduces the bug.
 * **Comparison with the named-register path (2026-10-19).**
   * What it did: it forced placement through reserved registers. 4-dword accumulators
     accumulated in place. 16-dword accumulators needed copies around every MFMA (+20% in
-    the demo). MHA `ml` cost +0.25%. D=64 `v_o` cost +6.4%. That cost was put down to
-    occupancy and copies; the experiment below reaches 256 VGPRs at no cost, which leaves
-    the copies around the loop as the likely cause.
-  * What hints do instead: no copies inside the MFMA chain where a hint holds. Copies
-    appear only where the allocator moves a value into the range: `a[0:3]` soft, and the
-    experiment below. But a hint holds only where coalescing keeps the hinted register.
-* **Experiment, not part of the PR patch.** A 40-line `SIRegisterInfo::updateRegAllocHint`
-  override carries the sched hint onto the register the coalescer keeps. It was built
-  remotely only, on top of the required patches. Results (5 rounds):
-  * D=64 `v_o` → `v[224:255]`: the PV MFMAs accumulate in place in `v[224:255]`, with copies
-    into the range only outside the MFMA chain. VGPRs 164 → 256; time 2371.0 vs 2370.8 us
-    unpinned.
-  * D=128 `o`: the PV MFMAs accumulate in `v[192:255]`. 256 VGPRs, 6 VGPRs spilled (28 bytes
-    of scratch, no LDS-read hazards). 7438.1 vs 7431.4 us (+0.09%).
-  * D=128 `ml`: `v190`/`v191` now hold the row max/sum (2 copies). 7426.4 us.
-  * Strict and soft give the same ISA in every case.
-  * With the hint carried across coalescing, loop-carried pins do get their registers, at no
-    measurable cost in this kernel. Whether to add this to the patch is open.
+    the demo; hints: 0 copies). MHA `ml` cost +0.25% (hints: no measurable cost). D=64
+    `v_o` cost +6.4% (hints: +0.1%).
+  * That +6.4% was put down to occupancy and copies. The 256-VGPR result above leaves the
+    copies around the loop as the likely cause.
 
 ## Issue programs
 

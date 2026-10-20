@@ -1,0 +1,133 @@
+diff --git a/llvm/lib/Target/AMDGPU/SIRegisterInfo.cpp b/llvm/lib/Target/AMDGPU/SIRegisterInfo.cpp
+index 7dee2c3ed..e6d75199c 100644
+--- a/llvm/lib/Target/AMDGPU/SIRegisterInfo.cpp
++++ b/llvm/lib/Target/AMDGPU/SIRegisterInfo.cpp
+@@ -4241,6 +4241,31 @@ bool SIRegisterInfo::getRegAllocationHints(Register VirtReg,
+   }
+ }
+ 
++// Keep llvm.amdgcn.sched.{bank,vgpr,sgpr,agpr} hints alive across coalescing.
++// The coalescer merges \p Reg into \p NewReg and drops \p Reg. Without this the
++// surviving register keeps only its own (copy) hint, so a hint on a value that
++// becomes a loop phi, or that PHI elimination copies, is lost before allocation.
++// A strict hint already on \p NewReg wins; otherwise \p Reg's hint is carried over
++// unless both are soft, so a soft hint never replaces a strict one.
++static bool isScheduleHint(unsigned Type) {
++  return Type >= AMDGPURI::BankHint && Type <= AMDGPURI::StrictAGPRRegHint;
++}
++
++void SIRegisterInfo::updateRegAllocHint(Register Reg, Register NewReg,
++                                        MachineFunction &MF) const {
++  if (!Reg.isVirtual() || !NewReg.isVirtual())
++    return;
++  MachineRegisterInfo &MRI = MF.getRegInfo();
++  std::pair<unsigned, Register> Old = MRI.getRegAllocationHint(Reg);
++  if (!isScheduleHint(Old.first))
++    return;
++  std::pair<unsigned, Register> Cur = MRI.getRegAllocationHint(NewReg);
++  // A schedule hint already on NewReg wins unless Reg's is strict and it is not.
++  if (isScheduleHint(Cur.first) && ((Cur.first & 1) || !(Old.first & 1)))
++    return;
++  MRI.setRegAllocationHint(NewReg, Old.first, Old.second);
++}
++
+ MCRegister
+ SIRegisterInfo::getReturnAddressReg(const MachineFunction &MF) const {
+   // Not a callee saved register.
+diff --git a/llvm/lib/Target/AMDGPU/SIRegisterInfo.h b/llvm/lib/Target/AMDGPU/SIRegisterInfo.h
+index f030019ef..24e1c8482 100644
+--- a/llvm/lib/Target/AMDGPU/SIRegisterInfo.h
++++ b/llvm/lib/Target/AMDGPU/SIRegisterInfo.h
+@@ -371,6 +371,9 @@ public:
+   unsigned getRegPressureSetLimit(const MachineFunction &MF,
+                                   unsigned Idx) const override;
+ 
++  void updateRegAllocHint(Register Reg, Register NewReg,
++                          MachineFunction &MF) const override;
++
+   bool getRegAllocationHints(Register VirtReg, ArrayRef<MCPhysReg> Order,
+                              SmallVectorImpl<MCPhysReg> &Hints,
+                              const MachineFunction &MF, const VirtRegMap *VRM,
+diff --git a/llvm/test/CodeGen/AMDGPU/sched-gpr-hint-coalescing.ll b/llvm/test/CodeGen/AMDGPU/sched-gpr-hint-coalescing.ll
+new file mode 100644
+index 000000000..781df3b59
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/sched-gpr-hint-coalescing.ll
+@@ -0,0 +1,77 @@
++; RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx950 -verify-machineinstrs < %s | FileCheck %s
++
++; A llvm.amdgcn.sched.vgpr hint on a loop-carried value must survive register
++; coalescing: the hinted copies are merged into the registers PHI elimination
++; creates, and the allocator only sees the surviving register's hint.
++
++declare <4 x float> @llvm.amdgcn.mfma.f32.16x16x32.bf16(<8 x bfloat>, <8 x bfloat>, <4 x float>, i32 immarg, i32 immarg, i32 immarg)
++declare <4 x float> @llvm.amdgcn.sched.vgpr.v4f32(<4 x float>, i32 immarg, i32 immarg)
++
++; CHECK-LABEL: {{^}}carried_strict:
++; CHECK-DAG: v_mfma_f32_16x16x32_bf16 v[40:43],
++; CHECK-DAG: v_mfma_f32_16x16x32_bf16 v[{{[0-9]+:[0-9]+}}], v[{{[0-9]+:[0-9]+}}], v[{{[0-9]+:[0-9]+}}], v[40:43]
++; CHECK: global_store_dwordx4 v{{[0-9]+}}, v[40:43]
++define amdgpu_kernel void @carried_strict(ptr addrspace(1) %in, ptr addrspace(1) %out, i32 %n, i1 %c) #0 {
++entry:
++  %init = call <4 x float> @llvm.amdgcn.sched.vgpr.v4f32(<4 x float> zeroinitializer, i32 40, i32 1)
++  br label %loop
++loop:
++  %i = phi i32 [ 0, %entry ], [ %i.next, %latch ]
++  %acc.phi = phi <4 x float> [ %init, %entry ], [ %next, %latch ]
++  %acc = call <4 x float> @llvm.amdgcn.sched.vgpr.v4f32(<4 x float> %acc.phi, i32 40, i32 1)
++  %p = getelementptr <8 x bfloat>, ptr addrspace(1) %in, i32 %i
++  %a = load <8 x bfloat>, ptr addrspace(1) %p
++  %m0 = call <4 x float> @llvm.amdgcn.mfma.f32.16x16x32.bf16(<8 x bfloat> %a, <8 x bfloat> %a, <4 x float> %acc, i32 0, i32 0, i32 0)
++  %m1 = call <4 x float> @llvm.amdgcn.mfma.f32.16x16x32.bf16(<8 x bfloat> %a, <8 x bfloat> %a, <4 x float> %m0, i32 0, i32 0, i32 0)
++  br i1 %c, label %rescale, label %latch
++rescale:
++  %s = fmul <4 x float> %m1, <float 0.5, float 0.5, float 0.5, float 0.5>
++  br label %latch
++latch:
++  %m = phi <4 x float> [ %m1, %loop ], [ %s, %rescale ]
++  %next = call <4 x float> @llvm.amdgcn.sched.vgpr.v4f32(<4 x float> %m, i32 40, i32 1)
++  %i.next = add i32 %i, 1
++  %cmp = icmp slt i32 %i.next, %n
++  br i1 %cmp, label %loop, label %exit
++exit:
++  %r = call <4 x float> @llvm.amdgcn.sched.vgpr.v4f32(<4 x float> %next, i32 40, i32 1)
++  store <4 x float> %r, ptr addrspace(1) %out
++  ret void
++}
++
++; Soft hints to v44 on the initial value and the result, strict hints to v40 in
++; the loop: the strict hint wins wherever the registers are coalesced.
++; CHECK-LABEL: {{^}}soft_does_not_override_strict:
++; CHECK-NOT: v[44:47]
++; CHECK-DAG: v_mfma_f32_16x16x32_bf16 v[40:43],
++; CHECK-NOT: v[44:47]
++; CHECK: global_store_dwordx4 v{{[0-9]+}}, v[40:43]
++define amdgpu_kernel void @soft_does_not_override_strict(ptr addrspace(1) %in, ptr addrspace(1) %out, i32 %n, i1 %c) #0 {
++entry:
++  %init = call <4 x float> @llvm.amdgcn.sched.vgpr.v4f32(<4 x float> zeroinitializer, i32 44, i32 0)
++  br label %loop
++loop:
++  %i = phi i32 [ 0, %entry ], [ %i.next, %latch ]
++  %acc.phi = phi <4 x float> [ %init, %entry ], [ %next, %latch ]
++  %acc = call <4 x float> @llvm.amdgcn.sched.vgpr.v4f32(<4 x float> %acc.phi, i32 40, i32 1)
++  %p = getelementptr <8 x bfloat>, ptr addrspace(1) %in, i32 %i
++  %a = load <8 x bfloat>, ptr addrspace(1) %p
++  %m0 = call <4 x float> @llvm.amdgcn.mfma.f32.16x16x32.bf16(<8 x bfloat> %a, <8 x bfloat> %a, <4 x float> %acc, i32 0, i32 0, i32 0)
++  %m1 = call <4 x float> @llvm.amdgcn.mfma.f32.16x16x32.bf16(<8 x bfloat> %a, <8 x bfloat> %a, <4 x float> %m0, i32 0, i32 0, i32 0)
++  br i1 %c, label %rescale, label %latch
++rescale:
++  %s = fmul <4 x float> %m1, <float 0.5, float 0.5, float 0.5, float 0.5>
++  br label %latch
++latch:
++  %m = phi <4 x float> [ %m1, %loop ], [ %s, %rescale ]
++  %next = call <4 x float> @llvm.amdgcn.sched.vgpr.v4f32(<4 x float> %m, i32 40, i32 1)
++  %i.next = add i32 %i, 1
++  %cmp = icmp slt i32 %i.next, %n
++  br i1 %cmp, label %loop, label %exit
++exit:
++  %r = call <4 x float> @llvm.amdgcn.sched.vgpr.v4f32(<4 x float> %next, i32 44, i32 0)
++  store <4 x float> %r, ptr addrspace(1) %out
++  ret void
++}
++
++attributes #0 = { "amdgpu-flat-work-group-size"="1,256" }

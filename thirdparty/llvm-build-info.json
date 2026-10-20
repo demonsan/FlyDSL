@@ -17,6 +17,11 @@
         "file": "schedule-bank-and-gpr.patch",
         "description": "Support schedule bank and vgpr/agpr/sgpr hint",
         "upstream_status": "not yet submitted"
+      },
+      {
+        "file": "schedule-gpr-hint-coalescing.patch",
+        "description": "AMDGPU: carry llvm.amdgcn.sched.{bank,vgpr,sgpr,agpr} allocation hints onto the register the coalescer keeps (SIRegisterInfo::updateRegAllocHint), so a hint on a loop-carried value survives PHI elimination and coalescing; a soft hint never replaces a strict one. Test: llvm/test/CodeGen/AMDGPU/sched-gpr-hint-coalescing.ll.",
+        "upstream_status": "not yet submitted; fix on top of ROCm/FlyDSL#1307's schedule-bank-and-gpr.patch"
       }
     ]
   }

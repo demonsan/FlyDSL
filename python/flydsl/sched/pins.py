@@ -14,13 +14,17 @@ A pin is a register-allocation hint at a value's *definition*:
 A spec is ``"v42"``, ``"v[64:79]"``, ``"a[0:3]"`` or ``"s10"``/``"s[4:5]"``, strict by
 default; append ``" soft"`` (``"v[64:79] soft"``) for an advisory hint.
 
-Mechanism (ROCm/FlyDSL#1307, the required LLVM patch ``schedule-bank-and-gpr.patch``):
+Mechanism (ROCm/FlyDSL#1307; required LLVM patches ``schedule-bank-and-gpr.patch`` and
+``schedule-gpr-hint-coalescing.patch`` on the pinned LLVM, ``thirdparty/llvm-build-info.json``):
 each hint is ``rocdl.sched.{vgpr,agpr,sgpr} %v, regnum [soft]``, an identity op that
 lowers to ``llvm.amdgcn.sched.*`` and a pseudo; the pre-RA ``AMDGPUSchedBank`` pass
 turns it into a COPY and attaches an allocation hint to both sides, propagated through
-COPY / REG_SEQUENCE / INSERT_SUBREG / SUBREG_TO_REG.  A *strict* hint is a hard hint
-(``getRegAllocationHints`` returns true: the allocator considers only that register for
-the hinted virtual registers); a *soft* one only moves it to the front.  Widths are
+COPY / REG_SEQUENCE / INSERT_SUBREG / SUBREG_TO_REG, and the coalescer carries it onto
+the register it keeps (``SIRegisterInfo::updateRegAllocHint``, the second patch; without
+it a hint on a loop-carried value is lost when the phi is coalesced).  A *strict* hint is
+a hard hint (``getRegAllocationHints`` returns true: the allocator considers only that
+register for the hinted virtual registers) and is never replaced by a soft one; a *soft*
+one only moves the register to the front.  Widths are
 32/64/128/256/512 bits (``WIDTHS``); a wider value is split into leaves that take
 consecutive sub-ranges, and the backend silently drops a hint of any other width, so the
 verifier rejects those.
@@ -351,7 +355,8 @@ def check(sched: Schedule, target: Optional[TargetDesc] = None, report=None):
                 "PIN.CARRIED",
                 "info",
                 f"{reg} is hinted at the initial value, the loop-header phi (top of the body), the new value at the "
-                "end of the body and the loop result; whether the phi gets it is decided by the allocator",
+                "end of the body and the loop result; the hint survives coalescing of the phi "
+                "(schedule-gpr-hint-coalescing.patch)",
                 d.where,
             )
 
