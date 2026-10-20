@@ -1,7 +1,7 @@
 {
   "upstream": {
     "repository": "https://github.com/llvm/llvm-project.git",
-    "llvm_hash": "e2a39f504fee836e4def9581bed817ecc327b9dc",
+    "llvm_hash": "1df311a6f7d8af05d068ce835b60dfa5b199d2f8",
     "required_patches": [
       {
         "file": "rocdl-lld-argv0.patch",
@@ -12,8 +12,13 @@
         "file": "rocdl-waves-per-eu-range.patch",
         "description": "Support waves_per_eu min,max range attribute for full VGPR utilization.",
         "upstream_status": "merged into upstream: 4d5db577f969519703c348b8c7b02ee22987bd94"
+      }, 
+      {
+        "file": "schedule-bank-and-gpr.patch",
+        "description": "Support schedule bank and vgpr/agpr/sgpr hint",
+        "upstream_status": "not yet submitted"
       }
-    ],
-    "extensions": []
+    ]
   }
+
 }
