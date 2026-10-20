@@ -45,7 +45,8 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 from .ir import Op, Schedule, Section
 from .target import TargetDesc, load_target
 
-BRANCH = "yuyzhang512/llvm-project amdgpu-named-reg-pin-std @583640bc5"
+# Validated LLVM; flydsl/compiler/named_reg.py PIN_LLVM has the full record (base, backend commits, build).
+BRANCH = "yuyzhang512/llvm-project amdgpu-named-reg-pin-std @583640bc544035fcc87177fee0410e0d87693919 (LLVM 24.0.0git)"
 # Widths (dwords) SITargetLowering::getRegisterByName maps to a register on the branch:
 # 32-bit, or the VReg_64/96/128/256/512 resp. AReg_64/128/256/512 tuple classes.
 WIDTHS = {"v": (1, 2, 3, 4, 8, 16), "a": (1, 2, 4, 8, 16)}

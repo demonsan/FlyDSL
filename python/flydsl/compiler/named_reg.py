@@ -33,12 +33,32 @@ each pinned range, and how many register copies move values into or out of it
 Pure Python (stdlib only) so it can be used on a machine without ROCm;
 ``tools/named_reg/named_reg.py`` drives ``opt``/``llc``/``ld.lld`` and the JIT
 cache injection.
+
+The rewrite targets the LLVM in :data:`PIN_LLVM`; other revisions of the branch
+(or upstream LLVM, which has no VGPR names for ``llvm.read_register``) are untested.
 """
 
 import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
+
+# The LLVM the rewritten IR was validated with (docs/sched_ir_guide.md, "Register pins").
+PIN_LLVM = {
+    "repo": "https://github.com/yuyzhang512/llvm-project",
+    "branch": "amdgpu-named-reg-pin-std",
+    "commit": "583640bc544035fcc87177fee0410e0d87693919",  # 2026-10-13
+    "llvm_version": "24.0.0git",
+    # llvm/llvm-project main the branch is based on (merge base, 2026-08-24)
+    "upstream_base": "3c6519006af45003813933136037c376a23a1338",
+    # the AMDGPU backend commits pins depend on (the branch's clang commits are not used)
+    "backend_commits": {
+        "8613a6d45f": "[AMDGPU] Pin a local variable to a named VGPR/AGPR",
+        "2aec92e019": "[AMDGPU] Do not fold a splat through a copy to a physical register",
+        "565060911b": "[AMDGPU] Pick the MFMA AGPR form per instruction, not per function",
+    },
+    "build": "Release + assertions, LLVM_TARGETS_TO_BUILD=AMDGPU; tools opt, llc, ld.lld",
+}
 
 MARKER = ";flydsl.pin"
 

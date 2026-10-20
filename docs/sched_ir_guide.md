@@ -405,6 +405,23 @@ tested at `583640bc5`): a pinned value has no storage of its own, and every
 read or write becomes `llvm.read_register` / `llvm.write_register` with the
 range as an `MDString` name.
 
+**Required LLVM.** Upstream LLVM has no VGPR/AGPR names for `llvm.read_register`, so
+pins need an LLVM built from this branch. Validated revision (also in
+`flydsl/compiler/named_reg.py:PIN_LLVM`, and `named_reg.py build` records `llc --version`
+in `report.json` and warns on another version):
+
+| | |
+|---|---|
+| Repository / branch | `https://github.com/yuyzhang512/llvm-project`, `amdgpu-named-reg-pin-std` |
+| Commit | `583640bc544035fcc87177fee0410e0d87693919` (2026-10-13) |
+| LLVM version | `24.0.0git` |
+| Upstream base | `llvm/llvm-project` main `3c6519006af45003813933136037c376a23a1338` (2026-08-24) |
+| Backend commits used | `8613a6d45f` pin a local variable to a named VGPR/AGPR; `2aec92e019` do not fold a splat through a copy to a physical register; `565060911b` pick the MFMA AGPR form per instruction. The branch's three clang commits are not needed. |
+| Build | Release + assertions, `LLVM_TARGETS_TO_BUILD=AMDGPU`, tools `opt`, `llc`, `ld.lld` |
+
+FlyDSL itself (the bundled `_mlir`) is unchanged; only the final `opt`/`llc`/`ld.lld` of a
+pinned kernel come from this LLVM.
+
 ```python
 loop = Section("k", body.ops, loop=("k", rng), carried=("acc",))
 loop.pins = {"acc": "v[128:131]"}             # loop-carried: reserved for the whole function

@@ -10,7 +10,10 @@ toolchain compiles as no-ops.  This tool takes the per-kernel LLVM IR FlyDSL dum
 ``llvm.read_register`` / ``llvm.write_register`` (``flydsl/compiler/named_reg.py``),
 compiles it with the ``opt``/``llc``/``ld.lld`` of an LLVM built from the AMDGPU
 named-register branch, and runs the result through a copy of the JIT cache entry
-(``tools/inject_asm``), with no FlyDSL rebuild::
+(``tools/inject_asm``), with no FlyDSL rebuild.  Validated LLVM: ``named_reg.PIN_LLVM``
+(yuyzhang512/llvm-project ``amdgpu-named-reg-pin-std`` @ ``583640bc5``, LLVM 24.0.0git,
+based on llvm main ``3c6519006``); ``build`` records ``llc --version`` in ``report.json``
+and warns on another version::
 
     named_reg.py prepare WS -- python bench.py          # dump + cache one kernel (inject_asm prepare)
     named_reg.py build WS plain --llvm $L/bin           # unmodified IR: reproduces FlyDSL's ISA?
@@ -94,6 +97,17 @@ def build(ws: Path, variant: str, llvm_bin: Path, mode: str, llvm_opts: list, mc
         regs = sorted(res.regs)
         report.update(markers=len(res.markers), reads=res.reads, writes=res.writes, regs=res.regs)
     (out / "input.ll").write_text(text, encoding="utf-8")
+
+    version = _sh([llvm_bin / "llc", "--version"], "llc --version").stdout
+    expected = named_reg.PIN_LLVM
+    report["llc_version"] = " ".join(version.split())
+    report["pin_llvm_validated"] = {k: expected[k] for k in ("repo", "branch", "commit", "llvm_version")}
+    if f"LLVM version {expected['llvm_version']}" not in version:
+        print(
+            f"named_reg: warning: {llvm_bin / 'llc'} is not LLVM {expected['llvm_version']}; pins were validated with "
+            f"{expected['repo']} {expected['branch']} @ {expected['commit']}",
+            file=sys.stderr,
+        )
 
     cl = [f"--{o}" for o in llvm_opts]
     tgt = ["-mtriple=amdgcn-amd-amdhsa", f"-mcpu={mcpu}"]

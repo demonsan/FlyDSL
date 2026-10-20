@@ -385,3 +385,13 @@ def test_schedule_copy_is_independent():
     c = copy.deepcopy(s)
     c.sections[1].pins = {"acc": "v[128:143]"}
     assert not pins.has_pins(s) and pins.has_pins(c)
+
+
+def test_validated_pin_llvm_is_recorded_consistently():
+    """The LLVM revision pins were validated with is stated once in code and matches pins / docs."""
+    rec = named_reg.PIN_LLVM
+    assert rec["branch"] == "amdgpu-named-reg-pin-std" and rec["llvm_version"] == "24.0.0git"
+    assert len(rec["commit"]) == 40 and rec["commit"] in pins.BRANCH
+    doc = (_ROOT / "docs" / "sched_ir_guide.md").read_text(encoding="utf-8")
+    for key in ("commit", "upstream_base", "llvm_version"):
+        assert rec[key] in doc
